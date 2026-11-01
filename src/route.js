@@ -3,7 +3,10 @@
 // USDC in Penumbra leaves in slices. The interval and the optional random
 // buffer belong only to that exit.
 // USDC.noble and USDC already on Injective enter Penumbra in one move.
-// Short INJ can be filled from Osmosis inside that move.
+// When the Injective wallet cannot pay the IBC into Penumbra, row 7 of
+// MATRIX.md takes 0.25 USDC from the migration, multi-hops it to Osmosis,
+// swaps it for INJ, and bridges that INJ to the Injective wallet. The code
+// below still treats gas as an unpriced Osmosis balance. That is not the hop.
 //
 // The noble path still follows the known CCTP release shape. The page does
 // not show that sample as the product. Hop keys are cosmes. This page does
