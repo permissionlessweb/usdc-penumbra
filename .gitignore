@@ -1,0 +1,3 @@
+node_modules/
+dist/custody.test.js
+.DS_Store

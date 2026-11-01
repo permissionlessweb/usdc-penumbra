@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>USDC</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="src/styles.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>USDC</h1>
+        <button class="ghost" id="notes-open" type="button">Notes</button>
+      </header>
+
+      <section class="gate" aria-label="Wallets">
+        <div class="connects">
+          <div class="connect-line">
+            <button class="ghost" id="zafu" type="button">Connect Zafu</button>
+            <p id="zafu-status">Not connected.</p>
+            <p id="zafu-detail" class="addr"></p>
+          </div>
+          <div class="connect-line">
+            <button class="ghost" id="keplr" type="button">Connect Keplr</button>
+            <p id="keplr-status">Not connected.</p>
+            <ul id="keplr-accounts"></ul>
+          </div>
+        </div>
+      </section>
+
+      <figure id="flow"></figure>
+    </div>
+
+    <dialog id="notes">
+      <h2>Notes</h2>
+      <p>The figure shows the transfer. These notes name the same transfer.</p>
+      <h3>Connect</h3>
+      <ol>
+        <li>Connect Keplr and Zafu.</li>
+        <li>Leave both connected.</li>
+        <li>Keplr identifies USDC.noble.</li>
+        <li>Osmosis is one place that balance can sit.</li>
+        <li>Zafu opens the Penumbra account.</li>
+        <li>The connection is not a signature.</li>
+      </ol>
+      <h3>Transfer</h3>
+      <p>Migrate USDC.noble into USDC.inj.</p>
+      <p>Send the funds to a diversified address of the Zafu account.</p>
+      <p>Privacy starts in Penumbra.</p>
+      <h3>This cut</h3>
+      <p>This page does not send the query.</p>
+      <p>This page does not send a transaction.</p>
+      <button class="ghost" id="notes-close" type="button">Close</button>
+    </dialog>
+
+    <script type="module" src="dist/app.js"></script>
+  </body>
+</html>
