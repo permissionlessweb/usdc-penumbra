@@ -1,6 +1,6 @@
 <svg id="flow-plate" xmlns="http://www.w3.org/2000/svg" width="720" height="400" viewBox="0 0 720 400" role="img" aria-labelledby="flow-title flow-desc" fill="none" font-family="Iowan Old Style, Palatino, 'Palatino Linotype', Georgia, serif">
   <title id="flow-title">USDC.noble moves to a diversified address of the Zafu account</title>
-  <desc id="flow-desc">Keplr and Zafu connect together. Keplr identifies USDC.noble, including a balance on Osmosis. That USDC migrates into USDC.inj. The transfer arrives at a diversified address held by the connected Zafu account.</desc>
+  <desc id="flow-desc">Keplr and Zafu connect together. Keplr identifies USDC.noble, including a balance on Osmosis. That balance returns to Noble. Circle burns it and issues USDC.inj. When the Injective wallet cannot pay the fee, Osmosis buys that INJ and bridges it to the wallet. The transfer arrives at a diversified address held by the connected Zafu account.</desc>
   <defs>
     <clipPath id="clip-noble"><circle cx="168" cy="168" r="33"/></clipPath>
     <clipPath id="clip-inj"><circle cx="360" cy="168" r="33"/></clipPath>
@@ -15,7 +15,8 @@
     <circle cx="552" cy="168" r="22" stroke-width=".5" stroke-opacity=".18"/>
     <text x="552" y="112" text-anchor="middle" fill="currentColor" stroke="none" font-size="16">Zafu</text>
     <text x="552" y="222" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">diversified address</text>
-    <text x="360" y="364" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">USDC.noble becomes USDC.inj, then a diversified address of the Zafu account.</text>
+    <text x="360" y="356" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">USDC.noble returns to Noble. Circle issues USDC.inj.</text>
+    <text x="360" y="376" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">Then a diversified address of the Zafu account.</text>
   </g>
   <g class="branch" id="branch-noble-in" fill="none" stroke="currentColor" stroke-width=".9">
     <circle cx="168" cy="168" r="36" fill="#f3efe4" stroke-width=".9" stroke-opacity=".6"/>
@@ -29,7 +30,7 @@
     </g>
     <circle cx="168" cy="168" r="30" stroke-width=".5" stroke-opacity=".18"/>
     <text x="168" y="112" text-anchor="middle" fill="currentColor" stroke="none" font-size="16">USDC.noble</text>
-    <text x="168" y="226" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">including Osmosis</text>
+    <text x="168" y="226" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">back to Noble</text>
     <line x1="210" y1="168" x2="308" y2="168" stroke="#1a46c3" stroke-width="1.15"/>
     <polygon points="324,168 308,163 308,173" fill="#1a46c3" stroke="none"/>
     <text x="264" y="152" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">the migration</text>
@@ -47,6 +48,7 @@
     </g>
     <circle cx="360" cy="168" r="30" stroke-width=".5" stroke-opacity=".18"/>
     <text x="360" y="112" text-anchor="middle" fill="currentColor" stroke="none" font-size="16">USDC.inj</text>
+    <text x="360" y="226" text-anchor="middle" fill="currentColor" stroke="none" font-size="12.5" font-style="italic" opacity=".62">INJ for the fee</text>
     <line x1="402" y1="168" x2="512" y2="168"/>
     <polygon points="524,168 512,163.5 512,172.5" fill="currentColor" stroke="none"/>
   </g>

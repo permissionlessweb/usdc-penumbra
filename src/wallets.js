@@ -1,9 +1,12 @@
-// Zafu injects Symbol.for("penumbra") → origin → provider, from
-// @penumbra-zone/client. connect() returns a MessagePort. Speaking ViewService
-// on that port needs the Penumbra protobuf client, which this cut does not bundle.
-// Keplr is read for account addresses only. Chains are enabled if Keplr already
-// has them. This page does not suggest a chain, because that would hand Keplr
-// a direct RPC URL.
+// Zafu injects Symbol.for("penumbra") → origin → provider.
+// connect() returns a MessagePort. ViewService.addressByIndex on that port
+// returns one diversified address. This page does not fetch the extension
+// manifest, because that would be a network request, and it does not hold
+// the spend key. Keplr is read for account addresses. Balances are a separate
+// read. Chains are enabled if Keplr already has them. This page does not
+// suggest a chain, because that would hand Keplr a direct RPC URL.
+
+import { createViewClient, diversifiedAddress } from "./zafu.js";
 
 const PENUMBRA = Symbol.for("penumbra");
 const KEPLR_CHAINS = [
@@ -20,17 +23,25 @@ export function zafuInstalled() {
 export async function connectZafu() {
   const record = globalThis[PENUMBRA];
   const origins = record && typeof record === "object" ? Object.keys(record) : [];
-  if (!origins.length) return { installed: false, connected: false };
+  if (!origins.length) return { installed: false, connected: false, address: "" };
   const origin = origins[0];
   const provider = record[origin];
-  const port = await provider.connect();
-  return {
-    installed: true,
-    connected: Boolean(provider.isConnected?.()),
-    origin,
-    manifest: String(provider.manifest || ""),
-    port,
+  let portPromise;
+  const getPort = () => {
+    portPromise ??= provider.connect();
+    return portPromise;
   };
+  const close = () => {
+    portPromise?.then((port) => port.close()).catch(() => {});
+  };
+  try {
+    const view = createViewClient(getPort);
+    const address = await diversifiedAddress(view);
+    return { installed: true, connected: true, origin, address, view, close };
+  } catch (error) {
+    close();
+    throw error;
+  }
 }
 
 export function keplrInstalled() {
@@ -48,6 +59,7 @@ export async function connectKeplr() {
       keys.push({
         ...chain,
         bech32Address: key.bech32Address,
+        ethereumHexAddress: key.ethereumHexAddress || "",
         name: key.name,
         error: null,
       });

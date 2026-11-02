@@ -4,11 +4,16 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test src/machine.test.js && node build.mjs && node --test dist/custody.test.js"
+    "test": "node --test src/machine.test.js src/zafu.test.js src/balances.test.js src/tx.test.js src/circle.test.js src/walk.test.js && node build.mjs && node --test dist/custody.test.js"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "^1.10.1",
+    "@connectrpc/connect": "^1.7.0",
     "@noble/hashes": "^1.8.0",
     "@noble/secp256k1": "^2.2.3",
+    "@penumbra-zone/bech32m": "^18.0.0",
+    "@penumbra-zone/protobuf": "^11.0.0",
+    "@penumbra-zone/transport-dom": "^7.5.2",
     "@scure/base": "^1.2.5",
     "@scure/bip32": "^1.6.2",
     "@scure/bip39": "^1.5.4"

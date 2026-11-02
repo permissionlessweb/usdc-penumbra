@@ -1,6 +1,8 @@
-// Chain reads and broadcasts have one door: the Nym mixnet client
+// Broadcasts have one door: the Nym mixnet client
 // (@nymproject/nym-client-wasm, used from @nymproject/sdk). This cut does not
-// open that client. Nothing in this page may call a chain RPC directly.
+// open that client. query() and broadcast() stay closed.
+// Keplr does not return a balance, so the page reads those bank denoms from
+// the public LCD. That read is not a broadcast.
 
 export const TRANSPORT_NAME = "nym-mixnet";
 

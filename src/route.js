@@ -1,180 +1,153 @@
-// Wallet balances select the actions.
+// Balances select the actions. The person chooses how much of each balance to move.
 //
-// USDC in Penumbra leaves in slices. The interval and the optional random
-// buffer belong only to that exit.
-// USDC.noble and USDC already on Injective enter Penumbra in one move.
-// When the Injective wallet cannot pay the IBC into Penumbra, row 7 of
-// MATRIX.md takes 0.25 USDC from the migration, multi-hops it to Osmosis,
-// swaps it for INJ, and bridges that INJ to the Injective wallet. The code
-// below still treats gas as an unpriced Osmosis balance. That is not the hop.
+// USDC in Penumbra leaves in slices. The interval and the optional buffer
+// belong only to that exit. The USDC.noble that comes out is migrated and
+// deposited back to a diversified address of the same Zafu account.
+// USDC.noble that is already outside Penumbra migrates in one move.
+// USDC already on Injective deposits in one move.
 //
-// The noble path still follows the known CCTP release shape. The page does
-// not show that sample as the product. Hop keys are cosmes. This page does
-// not broadcast.
+// Circle burns the USDC.noble and mints it on Avalanche. The same Avalanche
+// transaction issues USDC.inj. A balance still on Osmosis returns to Noble in
+// that same transfer: the memo burns it on arrival. That bridge does not sell
+// the USDC into an Osmosis pool.
+//
+// When the Injective wallet cannot pay the IBC into Penumbra, quote the
+// shortfall on Osmosis and bridge that INJ to the wallet. The hop is the first
+// return step. Penumbra slices still leave before it. The pool is quoted when
+// that swap is signed. Circle's burn is quoted when that step runs. The
+// connected Keplr account signs. This page does not issue a hop key.
 
 export const RELEASE_DENOM = "0xa00C59fF5a080D2b954d0c75e46E22a0c371235a";
 export const RELEASE_CHAIN = "1776";
 export const AVALANCHE_CHAIN = "43114";
 export const NOBLE_CHAIN = "noble-1";
 export const USDC_NOBLE_DENOM = "uusdc";
+// Hash of transfer/channel-750/uusdc. This identifies the Osmosis balance.
+export const OSMOSIS_USDC_DENOM =
+  "ibc/498A0751C798A0D9A389AA3691123DADA57DAA4FE165D5C75894505B876BA6E4";
+// Hash of transfer/channel-122/inj. The fee swap pays this denom out.
+export const INJ_ON_OSMOSIS =
+  "ibc/64BA6E31FE887D66C6F8F31C7B1A80C7CA179239677B4088BB55F5EA07DBE273";
+export const OSMOSIS_TO_NOBLE = "channel-750";
+export const NOBLE_TO_OSMOSIS = "channel-1";
+export const OSMOSIS_TO_INJECTIVE = "channel-122";
+export const INJECTIVE_TO_PENUMBRA = "channel-494";
+// Bank denom of native USDC on Injective. The CCTP release still uses the
+// 0x contract address above.
+export const INJ_USDC_DENOM = `erc20:${RELEASE_DENOM}`;
 export const ZAFU_RECEIVER = "diversified address of the connected Zafu account, not derived yet";
 export const USER_INJ = "Injective account from the query, not connected in this cut";
 export const USER_OSMOSIS = "Osmosis account from the query, not connected in this cut";
-const INJ_ON_OSMOSIS = "INJ on Osmosis, denom not pinned";
-const OSMOSIS_IN = "spendable Osmosis balance, denom not pinned";
-const GAS_AMOUNT = "a bit, unpriced";
+const UNPINNED = "not pinned";
+const UNPRICED = "quoted at signing, not pinned";
 
-export const BALANCE_QUERY = [
-  {
-    asset: "Penumbra",
-    field: "penumbra",
-    options: [
-      ["no", "None"],
-      ["yes", "USDC"],
-    ],
-  },
-  {
-    asset: "USDC.noble",
-    field: "noble",
-    options: [
-      ["no", "None"],
-      ["yes", "USDC"],
-    ],
-  },
-  {
-    asset: "USDC.inj",
-    field: "usdcInj",
-    options: [
-      ["no", "None"],
-      ["yes", "USDC"],
-    ],
-  },
-  {
-    asset: "INJ",
-    field: "injGas",
-    options: [
-      ["enough", "Enough"],
-      ["short", "Short"],
-    ],
-  },
-  {
-    asset: "Osmosis",
-    field: "osmosis",
-    options: [
-      ["yes", "Funds"],
-      ["no", "None"],
-    ],
-  },
-];
+const SHORT_INJ = "INJ is short. This USDC is already on Injective.";
+const NO_USDC = "The query found no USDC.";
 
-const EMPTY = "not derived yet";
+export function migrateAmount(findings, amountOut, amountIn, amountOsmosis = "0") {
+  let total = 0n;
+  if (findings.penumbra) total += BigInt(amountOut || "0");
+  if (findings.noble) total += BigInt(amountIn || "0");
+  if (findings.osmosis) total += BigInt(amountOsmosis || "0");
+  return total.toString();
+}
 
 export function blockReason(findings) {
-  if (!findings.penumbra && !findings.noble && !findings.usdcInj) {
-    return "The query found no USDC.";
-  }
-  if ((findings.noble || findings.usdcInj) && findings.injGasShort && !findings.osmosisFunds) {
-    return "INJ is short. Osmosis has no funds.";
-  }
+  const pays = findings.penumbra || findings.noble || findings.osmosis;
+  if (!pays && !findings.usdcInj) return NO_USDC;
+  if (findings.injGasShort && findings.usdcInj && !pays) return SHORT_INJ;
   return "";
 }
 
-function enterSteps(findings) {
-  const steps = [];
-  const moving = findings.noble || findings.usdcInj;
-  if (findings.noble) {
-    steps.push(
-      {
-        id: "cctp-noble",
-        once: true,
-        hop: "In",
-        title: "Move USDC.noble",
-      },
-      {
-        id: "cctp-forward",
-        once: true,
-        hop: "In",
-        title: "Release USDC.inj",
-      },
-    );
-  }
-  if (moving && findings.injGasShort) {
-    steps.push({
-      id: "gas-osmosis",
-      once: true,
-      hop: "INJ",
-      title: findings.osmosisFunds ? "Bring INJ from Osmosis" : "INJ is short",
-    });
-  }
-  if (moving) {
-    steps.push({
-      id: "deposit",
-      once: true,
-      hop: "In",
-      title: "Enter Penumbra",
-    });
-  }
-  if (findings.noble) {
-    steps.push({
-      id: "wipe",
-      once: true,
-      hop: "Local",
-      title: "Wipe the inbound keys",
-    });
-  }
-  return steps;
+// The address that holds the USDC.noble pile the gas hop and the burn spend.
+// Penumbra slices share it. A Noble balance stays on its own key, and the
+// slices join that key. Osmosis joins whichever of those two already exists.
+export function pileRole(findings) {
+  if (findings.noble) return "noble";
+  if (findings.penumbra) return "exitNoble";
+  return "noble";
 }
 
-function exitSteps() {
-  return [
-    {
-      id: "leave",
-      hop: "Out",
-      title: "Leave Penumbra",
-    },
-    {
-      id: "wipe",
-      hop: "Local",
-      title: "Wipe the slice keys",
-    },
-  ];
+function gasStep() {
+  return { id: "gas-osmosis", once: true, hop: "INJ", title: "Buy INJ for the Injective fee" };
+}
+
+export function planFor(findings) {
+  const blocked = blockReason(findings);
+  if (blocked) throw new Error(blocked);
+  const pays = findings.penumbra || findings.noble || findings.osmosis;
+  const once = [];
+  if (pays && findings.injGasShort) once.push(gasStep());
+  if (findings.osmosis) {
+    once.push({ id: "gather-osmosis", once: true, hop: "In", title: "Return Osmosis USDC to Noble" });
+  }
+  if (findings.penumbra && findings.noble) {
+    once.push({ id: "gather-exit", once: true, hop: "In", title: "Join the Penumbra receipts" });
+  }
+  if (pays) {
+    once.push(
+      { id: "cctp-noble", once: true, hop: "In", title: "Burn USDC.noble" },
+      { id: "cctp-forward", once: true, hop: "In", title: "Issue USDC.inj" },
+    );
+  }
+  if (pays || findings.usdcInj) {
+    once.push({ id: "deposit", once: true, hop: "In", title: "Enter Penumbra" });
+  }
+  if (pays) {
+    once.push({ id: "wipe", once: true, hop: "Local", title: "Wipe the inbound keys" });
+  }
+  const exit = findings.penumbra
+    ? [{ id: "leave", hop: "Out", title: "Leave Penumbra" }]
+    : [];
+  return { exit, once };
 }
 
 export function stepsFor(findings) {
-  return [...enterSteps(findings), ...(findings.penumbra ? exitSteps() : [])];
+  const plan = planFor(findings);
+  return [...plan.exit, ...plan.once];
 }
 
-export function keysForStep(stepId) {
-  if (stepId === "cctp-noble") return ["noble", "avalanche"];
+export function keysForStep(stepId, findings = {}) {
+  const pile = pileRole(findings);
+  if (stepId === "cctp-noble") return pile === "noble" ? ["noble", "avalanche"] : ["avalanche"];
   if (stepId === "cctp-forward") return ["injLeave"];
   if (stepId === "leave") return ["exitNoble"];
+  if (stepId === "gather-osmosis" || stepId === "gather-exit") return pile === "noble" ? ["noble"] : [];
   return [];
 }
 
 function addr(value) {
-  return value || EMPTY;
+  return value || "not derived yet";
 }
 
-function ibcTransfer(sender, denom, amount, receiver) {
+function ibcTransfer(sender, denom, amount, receiver, channel, memo = "") {
   return {
     type: "cosmos-sdk/MsgTransfer",
     value: {
       source_port: "transfer",
-      source_channel: "not pinned",
+      source_channel: channel,
       token: { denom, amount },
       sender,
       receiver,
       timeout_height: {},
       timeout_timestamp: "set at signing",
-      memo: "",
+      memo,
     },
   };
+}
+
+function named(ctx, role, fallback) {
+  return ctx.addresses?.[role] || fallback;
 }
 
 export function describeStep(stepId, ctx) {
   const a = ctx.addresses;
   const findings = ctx.findings;
-  const enterAmount = ctx.amountIn;
+  const pays = findings.penumbra || findings.noble || findings.osmosis;
+  const moved = pays
+    ? migrateAmount(findings, ctx.amountOut, ctx.amountIn, ctx.amountOsmosis)
+    : ctx.amountIn;
+  const holder = named(ctx, pileRole(findings), "");
   if (stepId === "leave") {
     return {
       detail: "This slice leaves Penumbra.",
@@ -193,7 +166,7 @@ export function describeStep(stepId, ctx) {
   }
   if (stepId === "cctp-noble") {
     return {
-      detail: "USDC.noble leaves Noble.",
+      detail: "Circle burns this USDC.noble and mints it on Avalanche.",
       messages: [
         {
           type: "cctpTransfer",
@@ -202,8 +175,8 @@ export function describeStep(stepId, ctx) {
             toChainId: AVALANCHE_CHAIN,
             burn_token: USDC_NOBLE_DENOM,
             asset: "USDC.noble",
-            amount: enterAmount,
-            signer: addr(a.noble),
+            amount: moved,
+            signer: addr(holder),
             mint_recipient: addr(a.avalanche),
           },
         },
@@ -212,7 +185,7 @@ export function describeStep(stepId, ctx) {
   }
   if (stepId === "cctp-forward") {
     return {
-      detail: "The same move releases USDC.inj.",
+      detail: "The same Avalanche transaction issues USDC.inj.",
       messages: [
         {
           type: "cctpTransfer",
@@ -239,7 +212,7 @@ export function describeStep(stepId, ctx) {
             chainId: RELEASE_CHAIN,
             denom: RELEASE_DENOM,
             asset: "USDC.inj",
-            amount: enterAmount,
+            amount: moved,
             released: true,
             recipient: addr(a.injEthereum),
           },
@@ -247,44 +220,99 @@ export function describeStep(stepId, ctx) {
       ],
     };
   }
-  if (stepId === "gas-osmosis") {
-    if (!findings.osmosisFunds) {
-      return {
-        detail: "INJ is short. Osmosis has no funds.",
-        messages: [],
-      };
-    }
-    const messages = [
-      {
-        type: "osmosis/gamm/swap-exact-amount-in",
-        value: {
-          sender: USER_OSMOSIS,
-          routes: [{ pool_id: "not pinned", token_out_denom: INJ_ON_OSMOSIS }],
-          token_in: { denom: OSMOSIS_IN, amount: GAS_AMOUNT },
-          token_out_min_amount: "unpriced",
-        },
-      },
-    ];
-    if (findings.noble) messages.push(ibcTransfer(USER_OSMOSIS, INJ_ON_OSMOSIS, GAS_AMOUNT, addr(a.injLeave)));
-    if (findings.usdcInj) messages.push(ibcTransfer(USER_OSMOSIS, INJ_ON_OSMOSIS, GAS_AMOUNT, USER_INJ));
+  if (stepId === "gather-osmosis") {
     return {
-      detail: "A small part of the Osmosis balance becomes INJ.",
-      messages,
+      detail: "This transfer returns the USDC to Noble and burns it on arrival.",
+      messages: [
+        ibcTransfer(
+          named(ctx, "userOsmosis", USER_OSMOSIS),
+          OSMOSIS_USDC_DENOM,
+          ctx.amountOsmosis,
+          addr(holder),
+          OSMOSIS_TO_NOBLE,
+        ),
+      ],
+    };
+  }
+  if (stepId === "gather-exit") {
+    return {
+      detail: "Penumbra receipts join the Noble balance.",
+      messages: [
+        {
+          type: "cosmos-sdk/MsgSend",
+          value: {
+            from_address: addr(a.exitNoble),
+            to_address: addr(a.noble),
+            amount: [{ denom: USDC_NOBLE_DENOM, amount: ctx.amountOut }],
+          },
+        },
+      ],
+    };
+  }
+  if (stepId === "gas-osmosis") {
+    return {
+      detail: "Osmosis buys the INJ the Injective fee still needs. That INJ bridges to the Injective wallet.",
+      messages: [
+        {
+          type: "osmosis/poolmanager/swap-exact-amount-out",
+          value: {
+            sender: named(ctx, "userOsmosis", USER_OSMOSIS),
+            routes: [{ pool_id: UNPINNED, token_in_denom: OSMOSIS_USDC_DENOM }],
+            token_in_max_amount: UNPRICED,
+            token_out: { denom: INJ_ON_OSMOSIS, amount: UNPRICED },
+          },
+        },
+        ibcTransfer(
+          named(ctx, "userOsmosis", USER_OSMOSIS),
+          INJ_ON_OSMOSIS,
+          UNPRICED,
+          named(ctx, "userInj", USER_INJ),
+          OSMOSIS_TO_INJECTIVE,
+        ),
+      ],
     };
   }
   if (stepId === "deposit") {
     const messages = [];
-    if (findings.noble) messages.push(ibcTransfer(addr(a.injLeave), RELEASE_DENOM, enterAmount, ZAFU_RECEIVER));
-    if (findings.usdcInj) {
-      messages.push(ibcTransfer(USER_INJ, RELEASE_DENOM, findings.noble ? "already held, unread in this cut" : enterAmount, ZAFU_RECEIVER));
+    const receiver = a?.zafu || ZAFU_RECEIVER;
+    if (pays) {
+      messages.push(ibcTransfer(addr(a.injLeave), INJ_USDC_DENOM, moved, receiver, INJECTIVE_TO_PENUMBRA));
     }
-    return {
-      detail: "USDC enters the Zafu account.",
-      messages,
-    };
+    if (findings.usdcInj) {
+      messages.push(ibcTransfer(
+        named(ctx, "userInj", USER_INJ),
+        INJ_USDC_DENOM,
+        pays ? (ctx.amountHeld ?? "already held, unread in this cut") : ctx.amountIn,
+        receiver,
+        INJECTIVE_TO_PENUMBRA,
+      ));
+    }
+    return { detail: "USDC enters the Zafu account. The Injective wallet pays the gas.", messages };
   }
-  return {
-    detail: "The page drops the keys for this slice.",
-    messages: [],
+  return { detail: "No hop key was issued.", messages: [] };
+}
+
+const UNREADY = /not pinned|not derived|quoted at signing|not connected|unread in this cut/;
+
+export function signingGaps(messages) {
+  const gaps = new Set();
+  const walk = (value) => {
+    if (typeof value === "string") {
+      if (UNREADY.test(value)) gaps.add(value);
+      return;
+    }
+    if (Array.isArray(value)) value.forEach(walk);
+    else if (value && typeof value === "object") Object.values(value).forEach(walk);
   };
+  for (const message of messages) walk(message);
+  return [...gaps];
+}
+
+export function closedDoors() {
+  return [
+    "The mixnet is closed.",
+    "Bank balances are read from the chain LCD.",
+    "Penumbra balances are read from Zafu.",
+    "A swapping route is refused.",
+  ];
 }

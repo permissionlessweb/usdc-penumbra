@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src https://lcd.osmosis.zone https://noble-api.polkachu.com https://lcd.injective.network https://sqs.osmosis.zone https://api.skip.build; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>USDC</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -20,17 +20,34 @@
 
       <section class="gate" aria-label="Wallets">
         <div class="connects">
-          <div class="connect-line">
+          <div class="connect">
             <button class="ghost" id="zafu" type="button">Connect Zafu</button>
             <p id="zafu-status">Not connected.</p>
-            <p id="zafu-detail" class="addr"></p>
           </div>
-          <div class="connect-line">
+          <div class="connect">
             <button class="ghost" id="keplr" type="button">Connect Keplr</button>
             <p id="keplr-status">Not connected.</p>
-            <ul id="keplr-accounts"></ul>
           </div>
         </div>
+      </section>
+
+      <section class="holdings" aria-label="Balances">
+        <ul id="balances"></ul>
+        <div id="slices" hidden>
+          <p class="kicker">Leave Penumbra</p>
+          <div class="slice-fields">
+            <label>Slices <input id="slice-count" type="number" min="1" max="12" value="1" /></label>
+            <label>Interval, seconds <input id="slice-interval" type="number" min="0" value="0" /></label>
+            <label>Buffer, seconds <input id="slice-buffer" type="number" min="0" value="0" /></label>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="read" type="button">Read</button>
+          <button class="ghost" id="begin" type="button" disabled>Begin</button>
+          <button class="ghost" id="restart" type="button">Restart</button>
+        </div>
+        <p id="begin-status"></p>
+        <ol id="plan"></ol>
       </section>
 
       <figure id="flow"></figure>
@@ -46,15 +63,30 @@
         <li>Keplr identifies USDC.noble.</li>
         <li>Osmosis is one place that balance can sit.</li>
         <li>Zafu opens the Penumbra account.</li>
+        <li>Read one diversified address from that account.</li>
         <li>The connection is not a signature.</li>
       </ol>
       <h3>Transfer</h3>
       <p>Migrate USDC.noble into USDC.inj.</p>
+      <p>Return a balance on Osmosis to Noble with the burn in that transfer.</p>
+      <p>The Noble account does not pay a fee for that burn.</p>
+      <p>Circle burns USDC.noble that is already on Noble and issues USDC.inj.</p>
+      <p>Choose an amount on each balance.</p>
+      <p>Max uses the full balance.</p>
       <p>Send the funds to a diversified address of the Zafu account.</p>
+      <p>The deposit asks Zafu until that Penumbra balance increases.</p>
       <p>Privacy starts in Penumbra.</p>
+      <p>When the Injective wallet cannot pay the fee, buy that INJ on Osmosis first.</p>
+      <p>Bridge that INJ to the Injective wallet.</p>
+      <p>Skip the swap when that wallet can already pay the fee.</p>
       <h3>This cut</h3>
-      <p>This page does not send the query.</p>
-      <p>This page does not send a transaction.</p>
+      <ul id="cut"></ul>
+      <p>Begin asks the wallet to sign the running step.</p>
+      <p>A step that cannot be signed stops. Later steps do not run.</p>
+      <p>A stopped step stays on the page. Restart reads the balances again.</p>
+      <p>Osmosis does not move until that wallet can pay the gas.</p>
+      <p>The fee swap is quoted at that step. A quote that does not pay INJ is not signed.</p>
+      <p>Circle burns USDC.noble. A route that sells the balance into a pool is not signed.</p>
       <button class="ghost" id="notes-close" type="button">Close</button>
     </dialog>
 

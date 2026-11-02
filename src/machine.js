@@ -1,4 +1,4 @@
-import { stepsFor } from "./route.js";
+import { blockReason, keysForStep, planFor } from "./route.js";
 
 export function splitAmount(amountBase, slices) {
   const total = BigInt(amountBase);
@@ -23,12 +23,12 @@ export function initRun(input) {
   const findings = {
     penumbra: Boolean(input.penumbra),
     noble: Boolean(input.noble),
+    osmosis: Boolean(input.osmosis),
     usdcInj: Boolean(input.usdcInj),
     injGasShort: Boolean(input.injGasShort),
-    osmosisFunds: Boolean(input.osmosisFunds),
   };
-  const inbound = findings.noble || findings.usdcInj;
-  if (!findings.penumbra && !inbound) throw new Error("The query found no USDC.");
+  const blocked = blockReason(findings);
+  if (blocked) throw new Error(blocked);
   let slices = 1;
   let intervalSec = 0;
   let jitterMaxSec = 0;
@@ -47,23 +47,38 @@ export function initRun(input) {
     jitterMaxSec = input.jitterMaxSec;
     if (BigInt(input.amountOut) <= 0n) throw new Error("amount must be positive");
   }
-  if (inbound && BigInt(input.amountIn) <= 0n) throw new Error("amount must be positive");
-  const amountBase = findings.penumbra ? input.amountOut : input.amountIn;
-  const steps = stepsFor(findings);
+  const inboundOnly = findings.usdcInj && !findings.noble && !findings.penumbra && !findings.osmosis;
+  if (findings.noble || inboundOnly) {
+    if (BigInt(input.amountIn || "0") <= 0n) throw new Error("amount must be positive");
+  }
+  if (findings.osmosis && BigInt(input.amountOsmosis || "0") <= 0n) {
+    throw new Error("amount must be positive");
+  }
+  const amountOut = findings.penumbra ? input.amountOut : "0";
+  const amountIn = findings.noble || findings.usdcInj ? input.amountIn : "0";
+  const amountOsmosis = findings.osmosis ? input.amountOsmosis : "0";
+  const amountBase = findings.penumbra ? amountOut : findings.noble ? amountIn : findings.osmosis ? amountOsmosis : amountIn;
+  const plan = planFor(findings);
+  const phase = plan.exit.length ? "exit" : "return";
   return {
     status: "idle",
     findings,
     slices,
     intervalSec,
     jitterMaxSec,
-    amountIn: inbound ? input.amountIn : "0",
+    amountIn,
+    amountOut,
+    amountOsmosis,
     amounts: splitAmount(amountBase, slices),
-    steps,
+    phase,
+    exitSteps: plan.exit,
+    onceSteps: plan.once,
+    steps: phase === "exit" ? plan.exit : plan.once,
     sliceIndex: 0,
     stepIndex: 0,
     drawnJitterSec: null,
     halt: null,
-    sliceKeys: Array.from({ length: slices }, emptyKeys),
+    keys: emptyKeys(),
   };
 }
 
@@ -73,6 +88,7 @@ export function currentStep(run) {
 
 export function stepState(run, sliceIndex, stepIndex) {
   if (run.status === "idle") return "pending";
+  if (run.exitSteps.length && run.phase === "return" && sliceIndex < run.slices) return "acked";
   if (sliceIndex < run.sliceIndex) return "acked";
   if (sliceIndex > run.sliceIndex) return "pending";
   if (run.status === "done" || run.status === "waiting") return "acked";
@@ -86,10 +102,9 @@ export function stepState(run, sliceIndex, stepIndex) {
   return "pending";
 }
 
-function noteKey(keys, role, note) {
-  if (!Object.hasOwn(keys, role)) throw new Error(`unknown hop ${role}`);
-  if (keys[role]) throw new Error(`${role} already noted`);
-  return { ...keys, [role]: note };
+export function keysNeeded(run) {
+  if (run.status !== "running") return [];
+  return keysForStep(currentStep(run).id, run.findings).filter((role) => !run.keys[role]);
 }
 
 export function reduce(run, event) {
@@ -99,20 +114,31 @@ export function reduce(run, event) {
   }
   if (event.type === "NOTE") {
     if (run.status !== "running") throw new Error("notes belong on a running step");
-    const keys = run.sliceKeys.map((item) => ({ ...item }));
-    keys[run.sliceIndex] = noteKey(keys[run.sliceIndex], event.role, {
-      address: event.address,
-      ethereum: event.ethereum ?? null,
-      keyId: event.keyId ?? null,
-    });
-    return { ...run, sliceKeys: keys };
+    if (!Object.hasOwn(run.keys, event.role)) throw new Error(`unknown hop ${event.role}`);
+    if (run.keys[event.role]) throw new Error(`${event.role} already noted`);
+    return {
+      ...run,
+      keys: {
+        ...run.keys,
+        [event.role]: {
+          address: event.address,
+          ethereum: event.ethereum ?? null,
+          keyId: event.keyId ?? null,
+        },
+      },
+    };
   }
   if (event.type === "ACK") {
     if (run.status !== "running") throw new Error("ack is only valid while running");
-    const lastStep = run.stepIndex === run.steps.length - 1;
-    const lastSlice = run.sliceIndex === run.slices - 1;
+    const steps = run.phase === "exit" ? run.exitSteps : run.onceSteps;
+    const lastStep = run.stepIndex === steps.length - 1;
     if (!lastStep) return { ...run, stepIndex: run.stepIndex + 1 };
-    if (!lastSlice) return { ...run, status: "waiting", drawnJitterSec: null };
+    if (run.phase === "exit" && run.sliceIndex < run.slices - 1) {
+      return { ...run, status: "waiting", drawnJitterSec: null };
+    }
+    if (run.phase === "exit" && run.onceSteps.length) {
+      return { ...run, phase: "return", status: "running", steps: run.onceSteps, stepIndex: 0 };
+    }
     return { ...run, status: "done" };
   }
   if (event.type === "FAIL") {
