@@ -2,8 +2,18 @@
 // asks Zafu to broadcast a withdrawal. A step is acknowledged only after the
 // balance it should change has changed. A failure stops the queue.
 
+import {
+  FORWARD_RECEIVER,
+  feeAmount,
+  feeSwapMemo,
+  matchUsdcPrice,
+  migrationMemo,
+  penumbraForwardMemo,
+  splitSlice,
+} from "./batch.js";
 import { LCD, formatUnits, readDenom } from "./balances.js";
 import {
+  ORBITER,
   assertCircleRoute,
   assertOsmosisCircleRoute,
   circleMessages,
@@ -25,6 +35,7 @@ import {
   pileRole,
 } from "./route.js";
 import { GAS, fee, signAndBroadcast, transferTimeout } from "./tx.js";
+import { nobleForwardChannel, nobleWithdrawalHeight } from "./zafu.js";
 
 const IBC_TIMEOUT_MS = 6 * 60 * 1000;
 const CCTP_TIMEOUT_MS = 8 * 60 * 1000;
@@ -92,6 +103,13 @@ async function untilAtLeast(io, timeoutMs, target, read) {
   return null;
 }
 
+function chainPlace(chainId) {
+  if (chainId === "osmosis-1") return "Osmosis";
+  if (chainId === "noble-1") return "Noble";
+  if (chainId === "injective-1") return "Injective";
+  return chainId;
+}
+
 async function sign(io, { chainId, signer, messages, gas }) {
   return signAndBroadcast({
     keplr: io.keplr,
@@ -102,20 +120,25 @@ async function sign(io, { chainId, signer, messages, gas }) {
     feeAmount: fee(chainId, gas),
     lcd: LCD[chainId],
     wait: clock(io, io.txTimeoutMs ?? 90_000),
+    onSubmitted(hash) {
+      io.onProgress?.(`Submitted ${hash}. Waiting for ${chainPlace(chainId)}.`);
+    },
   });
 }
 
-function transfer(sender, channel, denom, amount, receiver, nowMs) {
+function transfer(sender, channel, denom, amount, receiver, nowMs, memo = "") {
+  const value = {
+    source_port: "transfer",
+    source_channel: channel,
+    token: { denom, amount: String(amount) },
+    sender,
+    receiver,
+    timeout_timestamp: transferTimeout(nowMs),
+  };
+  if (memo) value.memo = memo;
   return {
     type: "/ibc.applications.transfer.v1.MsgTransfer",
-    value: {
-      source_port: "transfer",
-      source_channel: channel,
-      token: { denom, amount: String(amount) },
-      sender,
-      receiver,
-      timeout_timestamp: transferTimeout(nowMs),
-    },
+    value,
   };
 }
 
@@ -133,7 +156,10 @@ export function routesFromExactOut(quote) {
   const groups = Array.isArray(quote?.route) ? quote.route : [];
   if (groups.length !== 1) throw new Error("Osmosis did not quote the INJ swap.");
   const routes = [];
-  for (const pool of groups[0].pools || []) {
+  // SQS lists an exact-out route from the output token back to the input.
+  // The chain executes those pools from the input toward the output.
+  const pools = [...(groups[0].pools || [])].reverse();
+  for (const pool of pools) {
     const denom = pool?.token_in_denom || pool?.tokenInDenom;
     if (pool?.id == null || !denom) continue;
     routes.push({ pool_id: pool.id, token_in_denom: denom });
@@ -436,11 +462,15 @@ async function issueInj(ctx, io) {
 async function penumbraBalance(io) {
   if (!io.penumbraUsdc) throw new Error("Zafu is not connected.");
   const read = await io.penumbraUsdc();
-  return { amount: BigInt(read.amount), decimals: Number(read.decimals ?? 6) };
+  return {
+    noble: BigInt(read.noble ?? read.amount ?? "0"),
+    inj: BigInt(read.inj ?? "0"),
+    decimals: Number(read.decimals ?? 6),
+  };
 }
 
 function penumbraText(amount, decimals) {
-  return `${formatUnits(amount, decimals)} USDC`;
+  return `${formatUnits(amount, decimals)} USDC.inj`;
 }
 
 async function deposit(ctx, io) {
@@ -464,20 +494,20 @@ async function deposit(ctx, io) {
     messages: [transfer(sender, INJECTIVE_TO_PENUMBRA, INJ_USDC_DENOM, send, receiver, io.now())],
   });
   let latest = before;
-  const target = before.amount + 1n;
+  const target = before.inj + 1n;
   const after = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, target, async () => {
     latest = await penumbraBalance(io);
-    io.onPenumbra?.({ amount: latest.amount, before: before.amount, decimals: latest.decimals });
-    if (latest.amount < target) {
-      io.onProgress?.(`Asking Zafu. Penumbra USDC is ${penumbraText(latest.amount, latest.decimals)}.`);
+    io.onPenumbra?.({ noble: latest.noble, inj: latest.inj, before: before.inj, decimals: latest.decimals });
+    if (latest.inj < target) {
+      io.onProgress?.(`Asking Zafu. Penumbra USDC.inj is ${penumbraText(latest.inj, latest.decimals)}.`);
     }
-    return latest.amount;
+    return latest.inj;
   });
   if (after == null) {
-    throw new Error(`The packet has not arrived. Zafu still shows ${penumbraText(latest.amount, latest.decimals)}. ${sent.hash}`);
+    throw new Error(`The packet has not arrived. Zafu still shows ${penumbraText(latest.inj, latest.decimals)}. ${sent.hash}`);
   }
-  io.onPenumbra?.({ amount: after, before: before.amount, decimals: latest.decimals });
-  return `Penumbra holds ${penumbraText(after, latest.decimals)}, up from ${penumbraText(before.amount, before.decimals)}. ${sent.hash}`;
+  io.onPenumbra?.({ noble: latest.noble, inj: after, before: before.inj, decimals: latest.decimals });
+  return `Penumbra holds ${penumbraText(after, latest.decimals)}, up from ${penumbraText(before.inj, before.decimals)}. ${sent.hash}`;
 }
 
 function amountParts(value) {
@@ -486,9 +516,12 @@ function amountParts(value) {
   return { lo: amount & mask, hi: amount >> 64n };
 }
 
+// Unix nanoseconds, ten minutes ahead, rounded down to one minute.
+// Penumbra rejects a timestamp that is not a multiple of 60_000_000_000.
 function withdrawalTimeout(nowMs) {
-  const seconds = BigInt(Math.floor(nowMs / 1000)) + 600n;
-  return (seconds / 60n) * 60n;
+  const minute = 60_000_000_000n;
+  const nanos = BigInt(Math.floor(nowMs)) * 1_000_000n + 600n * 1_000_000_000n;
+  return (nanos / minute) * minute;
 }
 
 async function usdcReturn(view) {
@@ -500,31 +533,36 @@ async function usdcReturn(view) {
     const metadata = viewValue.value?.metadata;
     if (metadata?.symbol !== "USDC") continue;
     const match = RETURN_CHANNEL.exec(metadata.base || "");
-    if (match) return { base: metadata.base, channel: match[1] };
+    if (match) {
+      return {
+        base: metadata.base,
+        channel: match[1],
+        assetId: metadata.penumbraAssetId || viewValue.value?.assetId || null,
+      };
+    }
   }
   throw new Error("Penumbra did not name a return channel for this USDC.");
 }
 
-async function leave(run, ctx, io) {
-  const view = io.view;
-  if (!view) throw new Error("Zafu is not connected.");
-  const noble = addressOf(ctx, "exitNoble");
-  if (!noble) throw new Error("A required account is not connected.");
-  const named = await usdcReturn(view);
-  const ephemeral = await view.ephemeralAddress({ addressIndex: { account: 0 } });
-  if (!ephemeral?.address) throw new Error("Zafu did not return an address.");
-  const amount = run.amounts[run.sliceIndex];
-  const before = await bank(io, "noble-1", noble, USDC_NOBLE_DENOM);
+function heldKey(error, address) {
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(`${message} The Injective account ${address} is still held for this page session.`);
+}
+
+async function broadcastWithdrawal(view, io, named, returnAddress, withdrawal, onSent) {
+  const timeoutHeight = await nobleWithdrawalHeight(io.channels, io.clients, named.channel);
   const planned = await view.transactionPlanner({
     source: { account: 0 },
+    // FeeTier LOW. The reserve above is what the note must still contain.
+    feeMode: { case: "autoFee", value: { feeTier: 1 } },
     ics20Withdrawals: [{
-      amount: amountParts(amount),
       denom: { denom: named.base },
-      destinationChainAddress: noble,
-      returnAddress: ephemeral.address,
+      returnAddress,
       timeoutTime: withdrawalTimeout(io.now()),
+      timeoutHeight,
       sourceChannel: named.channel,
       useTransparentAddress: true,
+      ...withdrawal,
     }],
   });
   if (!planned?.plan) throw new Error("Zafu did not return a plan.");
@@ -533,20 +571,180 @@ async function leave(run, ctx, io) {
     if (update?.status?.case === "complete") transaction = update.status.value?.transaction;
   }
   if (!transaction) throw new Error("Zafu did not build the withdrawal.");
-  let broadcast = false;
+  let sent = false;
   for await (const update of view.broadcastTransaction({ transaction, awaitDetection: true })) {
     const name = update?.status?.case;
-    if (name === "broadcastSuccess" || name === "confirmed") broadcast = true;
+    if (name === "broadcastSuccess" || name === "confirmed") {
+      sent = true;
+      onSent();
+    }
   }
-  if (!broadcast) throw new Error("Zafu did not broadcast the withdrawal.");
-  const after = await untilAtLeast(
-    io,
-    io.ibcTimeoutMs ?? IBC_TIMEOUT_MS,
-    before + BigInt(amount),
-    () => bank(io, "noble-1", noble, USDC_NOBLE_DENOM),
-  );
-  if (after == null) throw new Error("Zafu broadcast the withdrawal. The Noble balance did not increase.");
-  return "Zafu broadcast the withdrawal.";
+  if (!sent) throw new Error("Zafu did not broadcast the withdrawal.");
+}
+
+async function leave(run, ctx, io) {
+  const view = io.view;
+  if (!view) throw new Error("Zafu is not connected.");
+  const osmosis = ctx.addresses?.userOsmosis || "";
+  if (!osmosis) throw new Error("A required account is not connected.");
+  const receiver = ctx.addresses?.zafu || "";
+  if (!receiver) throw new Error("Zafu is not connected.");
+  const named = await usdcReturn(view);
+  const ephemeral = await view.ephemeralAddress({ addressIndex: { account: 0 } });
+  if (!ephemeral?.address) throw new Error("Zafu did not return an address.");
+  if (!named.assetId) throw new Error("Penumbra did not price a USDC fee.");
+  if (!io.issueHop || !io.signHop || !io.wipeKey) throw new Error("The page cannot hold the Injective key.");
+  const hop = await io.issueHop("injective");
+  if (!hop?.keyId || !String(hop.address || "").startsWith("inj1") || !hop.ethereum) {
+    if (hop?.keyId) await io.wipeKey(hop.keyId);
+    throw new Error("The page cannot hold the Injective key.");
+  }
+
+  let broadcast = false;
+  try {
+    const injFee = fee("injective-1", GAS.deposit).amount;
+    const quoted = await quoteFee(io, injFee);
+    if (quoted.amountOut !== injFee) throw new Error("Osmosis did not quote the INJ swap.");
+    if (!view.gasPrices) throw new Error("Penumbra did not price a USDC fee.");
+    const priced = matchUsdcPrice(await view.gasPrices({}), named.assetId);
+    if (!priced) throw new Error("Penumbra did not price a USDC fee.");
+    // Two signatures. Each pays its own fee, so the note keeps two ceilings.
+    const parts = splitSlice(run.amounts[run.sliceIndex], quoted.amountIn, feeAmount(priced) * 2n);
+    const noble = addressOf(ctx, "noble") || ORBITER;
+    const { route, msgs } = await circleQuote(io, parts.migrate, OSMOSIS_USDC_DENOM, "osmosis-1", [
+      osmosis,
+      noble,
+      hop.ethereum,
+      hop.address,
+    ]);
+    assertOsmosisCircleRoute(route);
+    if (route.amount_in !== parts.migrate) throw new Error("The transfer does not burn on arrival.");
+    const buyMemo = feeSwapMemo(hop.address, injFee);
+    const migrateMemo = migrationMemo(msgs, osmosis, parts.migrate);
+    io.onProgress?.("Asking Zafu to sign the fee withdrawal.");
+    await broadcastWithdrawal(view, io, named, ephemeral.address, {
+      amount: amountParts(parts.buy),
+      destinationChainAddress: FORWARD_RECEIVER,
+      ics20Memo: buyMemo,
+    }, () => { broadcast = true; });
+    io.onProgress?.("Asking Zafu to sign the migration.");
+    await broadcastWithdrawal(view, io, named, ephemeral.address, {
+      amount: amountParts(parts.migrate),
+      destinationChainAddress: ORBITER,
+      ics20Memo: migrateMemo,
+    }, () => { broadcast = true; });
+  } catch (error) {
+    if (!broadcast) {
+      await io.wipeKey(hop.keyId);
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} The fee withdrawal was already sent. The Injective account ${hop.address} is still held for this page session.`);
+  }
+
+  try {
+    const injFee = BigInt(fee("injective-1", GAS.deposit).amount);
+    const deadline = io.now() + (io.cctpTimeoutMs ?? CCTP_TIMEOUT_MS);
+    let injHeld = 0n;
+    let usdcHeld = 0n;
+    while (io.now() <= deadline) {
+      injHeld = await bank(io, "injective-1", hop.address, "inj");
+      usdcHeld = await bank(io, "injective-1", hop.address, INJ_USDC_DENOM);
+      if (injHeld >= injFee && usdcHeld >= 1n) break;
+      io.onProgress?.(`Waiting for the Injective account. INJ is ${formatUnits(injHeld, 18)}. USDC.inj is ${formatUnits(usdcHeld, 6)}.`);
+      await io.sleep(io.intervalMs ?? POLL_MS);
+    }
+    if (injHeld < injFee || usdcHeld < 1n) {
+      throw new Error(`The Injective account did not receive the fee and the USDC. INJ is ${formatUnits(injHeld, 18)}. USDC.inj is ${formatUnits(usdcHeld, 6)}.`);
+    }
+    const before = await penumbraBalance(io);
+    const sent = await io.signHop({
+      keyId: hop.keyId,
+      chainId: "injective-1",
+      signer: hop.address,
+      gas: GAS.deposit,
+      messages: [transfer(hop.address, INJECTIVE_TO_PENUMBRA, INJ_USDC_DENOM, usdcHeld, receiver, io.now())],
+    });
+    let latest = before;
+    const target = before.inj + 1n;
+    const after = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, target, async () => {
+      latest = await penumbraBalance(io);
+      io.onPenumbra?.({ noble: latest.noble, inj: latest.inj, before: before.inj, decimals: latest.decimals });
+      if (latest.inj < target) {
+        io.onProgress?.(`Asking Zafu. Penumbra USDC.inj is ${penumbraText(latest.inj, latest.decimals)}.`);
+      }
+      return latest.inj;
+    });
+    if (after == null) {
+      throw new Error(`The packet has not arrived. Zafu still shows ${penumbraText(latest.inj, latest.decimals)}. ${sent.hash}`);
+    }
+    await io.wipeKey(hop.keyId);
+    return `Penumbra holds ${penumbraText(after, latest.decimals)}, up from ${penumbraText(before.inj, before.decimals)}. ${sent.hash}`;
+  } catch (error) {
+    throw heldKey(error, hop.address);
+  }
+}
+
+function nobleText(amount, decimals) {
+  return `${formatUnits(amount, decimals)} USDC.noble`;
+}
+
+// Dev return. One Osmosis transfer of the denom the page already reads.
+// Noble checks the packet receiver before it reads the forward memo. A
+// receiver that is not a bech32 address stops the packet there. This packet
+// names the connected Noble account. The memo sends that USDC on to the Zafu
+// address, on the channel the light client names. Nothing is signed until
+// that channel is the only open, active one. If the forward does not run,
+// the USDC credits that Noble account.
+export async function returnOsmosisToPenumbra(ctx, io) {
+  const view = io.view;
+  if (!view) throw new Error("Zafu is not connected.");
+  const sender = ctx.addresses?.userOsmosis || "";
+  if (!sender) throw new Error("A required account is not connected.");
+  const receiver = ctx.addresses?.zafu || "";
+  if (!receiver.startsWith("penumbra1")) throw new Error("Zafu is not connected.");
+  const noble = ctx.addresses?.userNoble || ctx.addresses?.noble || "";
+  if (!noble.startsWith("noble1")) throw new Error("A Noble account is not connected.");
+  const amount = BigInt(ctx.amountOsmosis || "0");
+  if (amount <= 0n) throw new Error("Choose an Osmosis amount.");
+  await requireFee(io, "osmosis-1", sender, GAS.hook, "Osmosis gas is short.");
+  io.onProgress?.("Asking the light client.");
+  const forward = await nobleForwardChannel(view, io.channels, io.clients);
+  const before = await penumbraBalance(io);
+  const memo = penumbraForwardMemo(receiver, forward.channel);
+  io.onProgress?.("Asking Keplr.");
+  let sent;
+  try {
+    sent = await sign(io, {
+      chainId: "osmosis-1",
+      signer: sender,
+      gas: GAS.hook,
+      messages: [transfer(sender, OSMOSIS_TO_NOBLE, OSMOSIS_USDC_DENOM, amount, noble, io.now(), memo)],
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} The packet was transfer/${OSMOSIS_TO_NOBLE} to ${noble}. Osmosis still holds this USDC.`);
+  }
+  let latest = before;
+  const target = before.noble + 1n;
+  const after = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, target, async () => {
+    latest = await penumbraBalance(io);
+    io.onPenumbra?.({
+      noble: latest.noble,
+      inj: latest.inj,
+      before: before.noble,
+      decimals: latest.decimals,
+      watch: "noble",
+    });
+    if (latest.noble < target) {
+      io.onProgress?.(`Asking Zafu. Penumbra USDC.noble is ${nobleText(latest.noble, latest.decimals)}.`);
+    }
+    return latest.noble;
+  });
+  if (after == null) {
+    throw new Error(`The packet has not arrived. Zafu still shows ${nobleText(latest.noble, latest.decimals)}. If Noble did not forward, ${noble} holds the USDC. ${sent.hash}`);
+  }
+  return `Penumbra holds ${nobleText(after, latest.decimals)}, up from ${nobleText(before.noble, before.decimals)}. ${sent.hash}`;
 }
 
 async function wipe(run, io) {

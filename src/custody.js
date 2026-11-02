@@ -1,4 +1,10 @@
+import { hmac } from "@noble/hashes/hmac";
+import { sha256 } from "@noble/hashes/sha2";
+import { etc, getPublicKey, sign } from "@noble/secp256k1";
 import { bech32 } from "@scure/base";
+
+// Sync secp256k1 signing needs an HMAC. The library does not ship one.
+etc.hmacSha256Sync = (key, ...msgs) => hmac(sha256, key, etc.concatBytes(...msgs));
 import { generateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { resolveBech32Address } from "../vendor/cosmes/address.ts";
@@ -39,6 +45,25 @@ export function issue(chain) {
   const keyId = crypto.randomUUID();
   keys.set(keyId, privateKey);
   return { keyId, address, ethereum, chain };
+}
+
+export function publicKeyOf(keyId) {
+  const key = keys.get(keyId);
+  if (!key) throw new Error("The page cannot hold the Injective key.");
+  return getPublicKey(key, true);
+}
+
+// Injective ethsecp256k1: keccak256 of the SignDoc, then R || S || V.
+// V is the recovery id 0 or 1. The private key stays in this module.
+export function signDigest(keyId, digest) {
+  const key = keys.get(keyId);
+  if (!key) throw new Error("The page cannot hold the Injective key.");
+  const signed = sign(digest, key, { lowS: true });
+  const compact = signed.toCompactRawBytes();
+  const out = new Uint8Array(65);
+  out.set(compact, 0);
+  out[64] = signed.recovery;
+  return out;
 }
 
 export function wipe(keyId) {

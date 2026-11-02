@@ -1,7 +1,10 @@
 // Protobuf encoding for the transactions Keplr signs directly.
 // Fees use the published minimum gas price: Osmosis 0.03 uosmo, Noble 0.1
 // uusdc, Injective 160000000 inj. The page does not fetch a chain RPC.
-// Keplr broadcasts the signed bytes.
+// Keplr broadcasts the signed bytes. A Penumbra slice's Injective account
+// signs locally: keccak256 of the direct SignDoc, then the LCD broadcast.
+
+import { keccak_256 } from "@noble/hashes/sha3";
 
 const textEncoder = new TextEncoder();
 
@@ -223,14 +226,30 @@ function txRaw(bodyBytes, authInfoBytes, signatures) {
   ]);
 }
 
+export function directSignBytes(bodyBytes, authInfoBytes, chainId, accountNumber) {
+  return concat([
+    fieldBytes(1, bodyBytes),
+    fieldBytes(2, authInfoBytes),
+    fieldString(3, chainId),
+    fieldVarint(4, accountNumber),
+  ]);
+}
+
+export function directSignDigest(bodyBytes, authInfoBytes, chainId, accountNumber) {
+  return keccak_256(directSignBytes(bodyBytes, authInfoBytes, chainId, accountNumber));
+}
+
 export function pubKeyType(chainId) {
   if (chainId === "injective-1") return "/injective.crypto.v1beta1.ethsecp256k1.PubKey";
   return "/cosmos.crypto.secp256k1.PubKey";
 }
 
-export async function readAccount(fetchImpl, lcd, address) {
+export async function readAccount(fetchImpl, lcd, address, options = {}) {
   const response = await fetchImpl(`${lcd}/cosmos/auth/v1beta1/accounts/${address}`);
-  if (!response.ok) throw new Error(`The account query failed (${response.status}).`);
+  if (!response.ok) {
+    if (response.status === 404 && options.missing) throw new Error(options.missing);
+    throw new Error(`The account query failed (${response.status}).`);
+  }
   const body = await response.json();
   const account = body.account?.base_account || body.account?.baseAccount || body.account || {};
   const accountNumber = account.account_number ?? account.accountNumber;
@@ -241,6 +260,69 @@ export async function readAccount(fetchImpl, lcd, address) {
   };
 }
 
+function maybeDecode(value) {
+  const text = String(value ?? "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text) || text.length % 4 !== 0 || text.length < 4) return text;
+  try {
+    const decoded = atob(text);
+    if (/^[\t\n\r\x20-\x7e]+$/.test(decoded)) return decoded;
+  } catch {
+    // The attribute was already plain text.
+  }
+  return text;
+}
+
+function eventDetails(tx) {
+  const found = [];
+  for (const event of tx?.events || []) {
+    for (const attr of event.attributes || []) {
+      const key = maybeDecode(attr.key);
+      if (key !== "error" && !key.endsWith(".error")) continue;
+      const value = maybeDecode(attr.value).trim();
+      if (value) found.push(value);
+    }
+  }
+  return found;
+}
+
+export function txFailureMessage(code, log, details = []) {
+  const parts = [`The transaction failed (${code}).`];
+  for (const item of [log, ...details]) {
+    const text = String(item || "").trim();
+    if (!text || parts.some((part) => part.includes(text))) continue;
+    parts.push(text);
+  }
+  return parts.join(" ");
+}
+
+function broadcastFailure(error) {
+  if (error instanceof Error) {
+    const message = error.message || "";
+    if (/reject/i.test(message)) return "The signature was declined.";
+    return message || "The transaction failed.";
+  }
+  if (error && typeof error === "object") {
+    const code = error.code ?? error.tx_response?.code ?? error.txResponse?.code;
+    const tx = error.tx_response || error.txResponse || error;
+    const log = tx.raw_log || tx.rawLog || tx.log || error.log || error.message || "";
+    if (code != null && Number(code) !== 0) return txFailureMessage(Number(code), log, eventDetails(tx));
+    if (log) return String(log);
+  }
+  const text = String(error ?? "");
+  if (!text || text === "[object Object]") return "The transaction failed.";
+  if (/reject/i.test(text)) return "The signature was declined.";
+  return text;
+}
+
+// Sync mode can return the hash, or a CheckTx body when the node rejected it.
+function broadcastRejection(result) {
+  if (!result || typeof result !== "object" || result instanceof Uint8Array) return "";
+  const code = result.code ?? result.tx_response?.code ?? result.txResponse?.code;
+  if (code == null || Number(code) === 0) return "";
+  const tx = result.tx_response || result.txResponse || result;
+  return txFailureMessage(Number(code), tx.raw_log || tx.rawLog || tx.log || result.log || "", eventDetails(tx));
+}
+
 export async function pollTx(fetchImpl, lcd, hash, wait) {
   const started = wait.now();
   while (wait.now() - started <= wait.timeoutMs) {
@@ -249,7 +331,11 @@ export async function pollTx(fetchImpl, lcd, hash, wait) {
       const body = await response.json();
       const tx = body.tx_response || body.txResponse || {};
       if (tx.code != null && tx.height && tx.height !== "0") {
-        return { code: Number(tx.code), log: tx.raw_log || tx.rawLog || "" };
+        return {
+          code: Number(tx.code),
+          log: tx.raw_log || tx.rawLog || "",
+          details: eventDetails(tx),
+        };
       }
     }
     await wait.sleep(wait.intervalMs);
@@ -267,6 +353,7 @@ export async function signAndBroadcast({
   lcd,
   wait,
   memo = "",
+  onSubmitted,
 }) {
   const key = await keplr.getKey(chainId);
   const pubKey = asBytes(key?.pubKey);
@@ -298,13 +385,71 @@ export async function signAndBroadcast({
     asBytes(signed?.signed?.authInfoBytes || authInfoBytes),
     [signature],
   );
-  const hash = txHashOf(await keplr.sendTx(chainId, raw, "sync"));
+  let broadcast;
+  try {
+    broadcast = await keplr.sendTx(chainId, raw, "sync");
+  } catch (error) {
+    throw new Error(broadcastFailure(error));
+  }
+  const rejected = broadcastRejection(broadcast);
+  if (rejected) throw new Error(rejected);
+  const hash = txHashOf(broadcast);
+  onSubmitted?.(hash);
   const result = await pollTx(fetchImpl, lcd, hash, wait);
-  if (result.code !== 0) throw new Error(result.log || `The transaction failed (${result.code}).`);
+  if (result.code !== 0) throw new Error(txFailureMessage(result.code, result.log, result.details));
   return { hash };
 }
 
 function txHashOf(result) {
   if (typeof result === "string") return result.replace(/^0x/i, "").toUpperCase();
   return bytesToHex(asBytes(result));
+}
+
+export async function signAndBroadcastLocal({
+  fetchImpl,
+  chainId,
+  signer,
+  messages,
+  feeAmount,
+  lcd,
+  wait,
+  pubKey,
+  signDigest,
+  memo = "",
+}) {
+  const account = await readAccount(fetchImpl, lcd, signer, {
+    missing: "The Injective account has not been created.",
+  });
+  const bodyBytes = txBody(messages.map(encodeMessage), memo);
+  const authInfoBytes = authInfo({
+    pubKey,
+    pubKeyType: pubKeyType(chainId),
+    sequence: account.sequence,
+    feeAmount,
+  });
+  const signature = await signDigest(directSignDigest(bodyBytes, authInfoBytes, chainId, account.accountNumber));
+  if (!(signature instanceof Uint8Array) || signature.length !== 65) {
+    throw new Error("The signature was declined.");
+  }
+  const raw = txRaw(bodyBytes, authInfoBytes, [signature]);
+  const response = await fetchImpl(`${lcd}/cosmos/tx/v1beta1/txs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tx_bytes: bytesToBase64(raw), mode: "BROADCAST_MODE_SYNC" }),
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch {
+    body = {};
+  }
+  const tx = body.tx_response || body.txResponse || {};
+  if (!response.ok || Number(tx.code) !== 0) {
+    throw new Error(txFailureMessage(tx.code ?? response.status, tx.raw_log || tx.rawLog || "", eventDetails(tx)));
+  }
+  const hash = String(tx.txhash || tx.txHash || "").replace(/^0x/i, "").toUpperCase();
+  if (!hash) throw new Error("The transaction was not found.");
+  const result = await pollTx(fetchImpl, lcd, hash, wait);
+  if (result.code !== 0) throw new Error(txFailureMessage(result.code, result.log, result.details));
+  return { hash };
 }

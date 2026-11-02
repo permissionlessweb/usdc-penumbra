@@ -9,11 +9,13 @@ import {
   prepareMigration,
   readDenom,
 } from "./balances.js";
-import { wipe } from "./custody.js";
+import { issue, publicKeyOf, signDigest, wipe } from "./custody.js";
 import { closedDoors } from "./route.js";
-import { walkMigration } from "./walk.js";
-import { connectKeplr, connectZafu, keplrInstalled, zafuInstalled } from "./wallets.js";
-import { readPenumbraUsdc } from "./zafu.js";
+import { isDevHost } from "./batch.js";
+import { GAS, fee, signAndBroadcastLocal } from "./tx.js";
+import { returnOsmosisToPenumbra, walkMigration } from "./walk.js";
+import { connectKeplr, connectZafu, keplrFingerprint, keplrInstalled, readKeplrKeys, walletToggle, zafuInstalled } from "./wallets.js";
+import { readPenumbraUsdc, zafuAccountId } from "./zafu.js";
 import flowSvg from "../figures/flow.svg";
 
 const ROWS = [
@@ -31,6 +33,8 @@ const balanceList = document.querySelector("#balances");
 const beginButton = document.querySelector("#begin");
 const restartButton = document.querySelector("#restart");
 const readButton = document.querySelector("#read");
+const devActions = document.querySelector("#dev-actions");
+const devReturn = document.querySelector("#dev-return");
 const beginStatus = document.querySelector("#begin-status");
 const plan = document.querySelector("#plan");
 const slices = document.querySelector("#slices");
@@ -41,8 +45,14 @@ const sliceBuffer = document.querySelector("#slice-buffer");
 let zafu = null;
 let keplr = null;
 let readGeneration = 0;
+let zafuGeneration = 0;
 let walking = false;
 let walkHeld = false;
+let accountsDirty = false;
+let accountTick = false;
+let connecting = false;
+const PENUMBRA = Symbol.for("penumbra");
+const KEPLR_PICKS = ["osmosis", "noble", "usdcInj"];
 const picks = {};
 const readings = {};
 for (const row of ROWS) readings[row.id] = { state: "unread", amount: "0", text: "Not read." };
@@ -50,26 +60,50 @@ readings.uosmo = { state: "unread", amount: "0", text: "Not read." };
 
 flowEl.innerHTML = flowSvg;
 
+function paintConnection(button, status, name, connection) {
+  const view = walletToggle(name, connection);
+  button.textContent = view.label;
+  button.disabled = walking || view.disabled;
+  button.title = connection?.error || view.title;
+  const detail = connection?.error || view.detail;
+  status.hidden = !detail;
+  status.textContent = detail;
+}
+
 function paintZafu() {
-  const open = Boolean(zafu?.connected);
-  zafuStatus.textContent = open
-    ? "Connected."
-    : zafu?.installed === false
-      ? "Not installed."
-      : "Not connected.";
+  const button = document.querySelector("#zafu");
+  if (!zafu) {
+    paintConnection(button, zafuStatus, "Zafu", { installed: true, connected: false });
+    return;
+  }
+  if (zafu.installed === false) {
+    paintConnection(button, zafuStatus, "Zafu", { installed: false, connected: false });
+    return;
+  }
+  paintConnection(button, zafuStatus, "Zafu", {
+    installed: true,
+    connected: Boolean(zafu.connected),
+    error: zafu.connected ? "" : zafu.error || "",
+  });
 }
 
 function paintKeplr() {
+  const button = document.querySelector("#keplr");
   if (!keplr) {
-    keplrStatus.textContent = "Not connected.";
+    paintConnection(button, keplrStatus, "Keplr", { installed: true, connected: false });
     return;
   }
   if (keplr.installed === false) {
-    keplrStatus.textContent = "Not installed.";
+    paintConnection(button, keplrStatus, "Keplr", { installed: false, connected: false });
     return;
   }
-  const ready = (keplr.keys || []).filter((key) => key.bech32Address);
-  keplrStatus.textContent = ready.length ? "Connected." : "No account enabled.";
+  const ready = (keplr.keys || []).some((key) => key.bech32Address);
+  const failed = (keplr.keys || []).find((key) => key.error);
+  paintConnection(button, keplrStatus, "Keplr", {
+    installed: true,
+    connected: ready,
+    error: ready ? "" : (keplr.error || failed?.error || (keplr.keys?.length ? "No account enabled." : "")),
+  });
 }
 
 function abbreviate(address) {
@@ -119,6 +153,13 @@ function decimalsFor(row) {
   return readings[row.id].decimals ?? row.decimals;
 }
 
+function penumbraAmountText(reading) {
+  const decimals = reading.decimals ?? 6;
+  const noble = formatUnits(reading.amount || "0", decimals);
+  const inj = formatUnits(reading.inj || "0", decimals);
+  return `${noble} USDC.noble · ${inj} USDC.inj`;
+}
+
 function fillMax() {
   for (const row of ROWS) {
     if (row.id === "inj") continue;
@@ -129,9 +170,10 @@ function fillMax() {
   }
 }
 
-function clampPicks() {
+function clampPicks(ids) {
   for (const row of ROWS) {
     if (row.id === "inj") continue;
+    if (ids && !ids.includes(row.id)) continue;
     const reading = readings[row.id];
     if (reading.state !== "ready") continue;
     const current = picks[row.id];
@@ -147,6 +189,15 @@ function clampPicks() {
       // The field keeps the text. Begin explains it.
     }
   }
+}
+
+function writePick(row, replace) {
+  const reading = readings[row.id];
+  const next = reading.state === "ready" && BigInt(reading.amount) > 0n
+    ? formatUnits(reading.amount, decimalsFor(row))
+    : "";
+  if (!replace && picks[row.id] != null && String(picks[row.id]).trim() !== "") return;
+  picks[row.id] = next;
 }
 
 function chosenBase() {
@@ -180,13 +231,32 @@ function syncBegin() {
     beginButton.disabled = true;
     restartButton.disabled = walking;
     readButton.disabled = walking;
+    syncDev(picked);
     return { ready: false, reason: picked.error, steps: [], moved: "0" };
   }
   const prep = prepareMigration({ ...snapshot(), chosen: picked.chosen }, timing());
   beginButton.disabled = walking || walkHeld || !prep.ready;
   restartButton.disabled = walking;
   readButton.disabled = walking;
+  paintZafu();
+  paintKeplr();
+  syncDev(picked);
   return prep;
+}
+
+function syncDev(picked) {
+  if (!devActions || !devReturn) return;
+  if (!isDevHost(location.hostname)) {
+    devActions.hidden = true;
+    devReturn.disabled = true;
+    return;
+  }
+  devActions.hidden = false;
+  const amount = picked?.chosen?.osmosis;
+  const osmosisReady = readings.osmosis.state === "ready" && amount && BigInt(amount) > 0n;
+  const gasReady = readings.uosmo.state === "ready"
+    && BigInt(readings.uosmo.amount) >= BigInt(fee("osmosis-1", GAS.hook).amount);
+  devReturn.disabled = walking || Boolean(picked?.error) || !zafu?.connected || !osmosisReady || !gasReady;
 }
 
 function rememberPick(row, value) {
@@ -194,6 +264,7 @@ function rememberPick(row, value) {
   if (walking) return;
   plan.replaceChildren();
   const prep = syncBegin();
+  beginStatus.classList.remove("error");
   beginStatus.textContent = prep.ready ? "" : prep.reason;
 }
 
@@ -220,7 +291,7 @@ function paintBalances() {
     amount.className = "amount";
     const ready = reading.state === "ready";
     amount.textContent = ready
-      ? `${formatUnits(reading.amount, decimalsFor(row))} ${row.symbol}`
+      ? (row.id === "penumbra" ? penumbraAmountText(reading) : `${formatUnits(reading.amount, decimalsFor(row))} ${row.symbol}`)
       : reading.text || "Not read.";
     item.append(place, amount);
     if (ready && row.id !== "inj" && BigInt(reading.amount) > 0n) {
@@ -271,7 +342,7 @@ async function readShield() {
   if (!zafu?.connected || !zafu.view) return { state: "unread", amount: "0", text: "Not read." };
   try {
     const result = await readPenumbraUsdc(zafu.view);
-    return { state: "ready", amount: result.amount, decimals: result.decimals };
+    return { state: "ready", amount: result.noble, inj: result.inj, decimals: result.decimals };
   } catch (error) {
     return { state: "unread", amount: "0", text: error.message };
   }
@@ -288,32 +359,53 @@ async function readUosmo() {
   }
 }
 
+function unread(text = "Not read.") {
+  return { state: "unread", amount: "0", text };
+}
+
 async function readBalances(options = {}) {
   const generation = ++readGeneration;
   const hold = options.hold === true || walkHeld;
-  if (!hold) {
+  const scope = options.scope === "penumbra" || options.scope === "keplr" ? options.scope : "";
+  if (!hold && !scope) {
     beginStatus.textContent = "Reading.";
     plan.replaceChildren();
   }
+  const keplrRows = ROWS.filter((row) => row.chainId);
   const [bank, shield, uosmo] = await Promise.all([
-    Promise.all(ROWS.filter((row) => row.chainId).map((row) => readBank(row))),
-    readShield(),
-    readUosmo(),
+    scope === "penumbra" ? null : Promise.all(keplrRows.map((row) => readBank(row))),
+    scope === "keplr" ? null : readShield(),
+    scope === "penumbra" ? null : readUosmo(),
   ]);
   if (generation !== readGeneration) return;
-  ROWS.filter((row) => row.chainId).forEach((row, index) => {
-    readings[row.id] = bank[index];
-  });
-  readings.penumbra = shield;
-  readings.uosmo = uosmo;
-  if (options.keepPicks || hold) clampPicks();
-  else fillMax();
+  if (bank) keplrRows.forEach((row, index) => { readings[row.id] = bank[index]; });
+  if (shield) readings.penumbra = shield;
+  if (uosmo) readings.uosmo = uosmo;
+  if (!scope) {
+    if (options.keepPicks || hold) clampPicks();
+    else fillMax();
+  } else {
+    const ids = scope === "penumbra" ? ["penumbra"] : KEPLR_PICKS;
+    if (options.replacePicks) {
+      for (const row of ROWS) {
+        if (ids.includes(row.id)) writePick(row, true);
+      }
+    } else if (options.keepPicks || hold) clampPicks(ids);
+    else {
+      for (const row of ROWS) {
+        if (ids.includes(row.id)) writePick(row, false);
+      }
+    }
+  }
   const prep = paintBalances();
   if (hold) {
     beginButton.disabled = true;
     return;
   }
-  beginStatus.textContent = prep.ready ? "" : prep.reason;
+  if ((!scope || options.announce) && !walking) {
+    beginStatus.classList.remove("error");
+    beginStatus.textContent = prep.ready ? "" : prep.reason;
+  }
 }
 
 function paintPlan(rows) {
@@ -344,17 +436,51 @@ function liveIo() {
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     random: Math.random,
     view: zafu?.view || null,
+    channels: zafu?.channels || null,
+    clients: zafu?.clients || null,
     penumbraUsdc() {
       if (!zafu?.view) throw new Error("Zafu is not connected.");
       return readPenumbraUsdc(zafu.view);
     },
-    onPenumbra({ amount, before, decimals }) {
-      readings.penumbra = { state: "ready", amount: amount.toString(), decimals };
+    onPenumbra({ noble, inj, before, decimals, watch }) {
+      const nobleAmount = noble ?? 0n;
+      const injAmount = inj ?? 0n;
+      readings.penumbra = {
+        state: "ready",
+        amount: nobleAmount.toString(),
+        inj: injAmount.toString(),
+        decimals,
+      };
       const item = balanceList.querySelector('[data-place="penumbra"]');
       const shown = item?.querySelector(".amount");
       if (!shown) return;
-      shown.textContent = `${formatUnits(amount, decimals)} USDC`;
-      item.classList.toggle("arrived", amount > before);
+      shown.textContent = penumbraAmountText(readings.penumbra);
+      const current = watch === "noble" ? nobleAmount : injAmount;
+      item.classList.toggle("arrived", current > before);
+    },
+    issueHop(chain) {
+      return issue(chain);
+    },
+    async signHop({ keyId, chainId, signer, messages, gas }) {
+      return signAndBroadcastLocal({
+        fetchImpl: globalThis.fetch.bind(globalThis),
+        chainId,
+        signer,
+        messages,
+        feeAmount: fee(chainId, gas),
+        lcd: LCD[chainId],
+        wait: {
+          now: () => Date.now(),
+          sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          timeoutMs: 90_000,
+          intervalMs: 4000,
+        },
+        pubKey: publicKeyOf(keyId),
+        signDigest: (digest) => signDigest(keyId, digest),
+      });
+    },
+    wipeKey(keyId) {
+      wipe(keyId);
     },
     wipeNoted(run) {
       let count = 0;
@@ -379,48 +505,246 @@ function paintWalk(view) {
   }
 }
 
+function clearSide(ids) {
+  for (const id of ids) {
+    readings[id] = unread();
+    delete picks[id];
+  }
+}
+
+function disconnectZafu() {
+  zafuGeneration += 1;
+  zafu?.close?.();
+  zafu = { installed: zafu?.installed !== false, connected: false, address: "" };
+  clearSide(["penumbra"]);
+  paintZafu();
+  paintBalances();
+}
+
+function disconnectKeplr() {
+  keplr = { installed: keplr?.installed !== false, keys: [] };
+  clearSide(["osmosis", "noble", "usdcInj", "inj"]);
+  readings.uosmo = unread();
+  paintKeplr();
+  paintBalances();
+}
+
+function penumbraProvider() {
+  const record = globalThis[PENUMBRA];
+  const origin = zafu?.origin;
+  return origin && record ? record[origin] : null;
+}
+
+function providerApproved(provider) {
+  if (!provider || typeof provider.isConnected !== "function") return false;
+  try {
+    return provider.isConnected() === true;
+  } catch {
+    return false;
+  }
+}
+
+async function watchKeplrAccounts() {
+  if (!keplr?.keys?.some((key) => key.bech32Address)) return;
+  if (walking) {
+    accountsDirty = true;
+    return;
+  }
+  const keys = await readKeplrKeys();
+  if (walking) {
+    accountsDirty = true;
+    return;
+  }
+  if (!keys || keplrFingerprint(keys) === keplrFingerprint(keplr?.keys)) return;
+  keplr = { installed: true, keys };
+  paintKeplr();
+  await readBalances({ scope: "keplr", replacePicks: true });
+}
+
+async function watchOpenZafu() {
+  if (!zafu?.connected || !zafu.view) return;
+  if (walking) {
+    accountsDirty = true;
+    return;
+  }
+  const generation = zafuGeneration;
+  let id = "";
+  try {
+    id = await zafuAccountId(zafu.view);
+  } catch {
+    if (generation !== zafuGeneration || walking) {
+      accountsDirty = walking;
+      return;
+    }
+    if (providerApproved(penumbraProvider())) await refreshZafuFromExtension();
+    return;
+  }
+  if (generation !== zafuGeneration || !zafu?.connected || walking) {
+    if (walking) accountsDirty = true;
+    return;
+  }
+  const address = id.slice(id.indexOf(":") + 1);
+  if (!id || id === zafu.accountId || (zafu.address && address === zafu.address && !zafu.accountId)) {
+    if (id && !zafu.accountId) zafu.accountId = id;
+    return;
+  }
+  zafu.accountId = id;
+  zafu.address = id.slice(id.indexOf(":") + 1);
+  paintZafu();
+  await readBalances({ scope: "penumbra", replacePicks: true });
+}
+
+async function refreshZafuFromExtension() {
+  if (!zafu?.connected) return;
+  if (walking) {
+    accountsDirty = true;
+    return;
+  }
+  const provider = penumbraProvider();
+  if (!providerApproved(provider)) {
+    await watchOpenZafu();
+    return;
+  }
+  const generation = zafuGeneration;
+  const previousId = zafu.accountId;
+  let next;
+  try {
+    next = await connectZafu();
+  } catch {
+    return;
+  }
+  if (generation !== zafuGeneration || walking || !zafu?.connected) {
+    next.close?.();
+    if (walking) accountsDirty = true;
+    return;
+  }
+  let nextId = "";
+  try {
+    nextId = await zafuAccountId(next.view);
+  } catch {
+    next.close?.();
+    return;
+  }
+  const sameAccount = nextId === previousId
+    || (next.address && next.address === zafu.address && (!previousId || !nextId || nextId === previousId));
+  if (sameAccount) {
+    if (nextId) zafu.accountId = nextId;
+    next.close?.();
+    return;
+  }
+  next.accountId = nextId;
+  const previous = zafu;
+  zafu = next;
+  previous?.close?.();
+  paintZafu();
+  await readBalances({ scope: "penumbra", replacePicks: true });
+}
+
+async function tickAccounts(forcePort) {
+  if (walking || connecting) {
+    if (walking) accountsDirty = true;
+    return;
+  }
+  if (accountTick) return;
+  accountTick = true;
+  try {
+    await watchKeplrAccounts();
+    if (forcePort) await refreshZafuFromExtension();
+    else await watchOpenZafu();
+  } finally {
+    accountTick = false;
+  }
+}
+
 document.querySelector("#zafu").addEventListener("click", async () => {
+  if (walking) return;
   if (!zafuInstalled()) {
     zafu = { installed: false, connected: false };
     paintZafu();
     return;
   }
-  zafuStatus.textContent = "Waiting.";
-  const previous = zafu;
-  try {
-    zafu = await connectZafu();
-    previous?.close?.();
-  } catch (error) {
-    zafu = { installed: true, connected: false };
-    paintZafu();
-    zafuStatus.textContent = error.message;
+  if (zafu?.connected) {
+    disconnectZafu();
     return;
   }
-  paintZafu();
-  await readBalances();
+  const button = document.querySelector("#zafu");
+  button.disabled = true;
+  button.textContent = "Connecting Zafu";
+  zafuStatus.hidden = true;
+  zafuStatus.textContent = "";
+  connecting = true;
+  zafuGeneration += 1;
+  const generation = zafuGeneration;
+  const previous = zafu;
+  try {
+    let next;
+    try {
+      next = await connectZafu();
+      if (generation !== zafuGeneration) {
+        next.close?.();
+        return;
+      }
+      next.accountId = "";
+      try {
+        next.accountId = await zafuAccountId(next.view);
+      } catch {
+        // The port is open. The balance read reports an address failure.
+      }
+    } catch (error) {
+      if (generation !== zafuGeneration) return;
+      zafu = { installed: true, connected: false, error: error instanceof Error ? error.message : String(error) };
+      paintZafu();
+      return;
+    }
+    zafu = next;
+    previous?.close?.();
+    paintZafu();
+    await readBalances({ scope: "penumbra", announce: true });
+  } finally {
+    connecting = false;
+  }
 });
 
 document.querySelector("#keplr").addEventListener("click", async () => {
+  if (walking) return;
   if (!keplrInstalled()) {
     keplr = { installed: false, keys: [] };
     paintKeplr();
     return;
   }
-  keplrStatus.textContent = "Waiting.";
-  try {
-    keplr = await connectKeplr();
-  } catch (error) {
-    keplr = { installed: true, keys: [] };
-    paintKeplr();
-    keplrStatus.textContent = error.message;
+  if (keplr?.keys?.some((key) => key.bech32Address)) {
+    disconnectKeplr();
     return;
   }
-  paintKeplr();
-  await readBalances();
+  const button = document.querySelector("#keplr");
+  button.disabled = true;
+  button.textContent = "Connecting Keplr";
+  keplrStatus.hidden = true;
+  keplrStatus.textContent = "";
+  connecting = true;
+  try {
+    try {
+      keplr = await connectKeplr();
+    } catch (error) {
+      keplr = { installed: true, keys: [], error: error instanceof Error ? error.message : String(error) };
+      paintKeplr();
+      return;
+    }
+    paintKeplr();
+    await readBalances({ scope: "keplr", announce: true });
+  } finally {
+    connecting = false;
+  }
 });
+
+window.addEventListener("keplr_keystorechange", () => { tickAccounts(false); });
+window.addEventListener("penumbra_keystorechange", () => { tickAccounts(true); });
+window.addEventListener("focus", () => { tickAccounts(true); });
+setInterval(() => { tickAccounts(true); }, 4000);
 
 readButton.addEventListener("click", () => {
   if (walking) return;
+  beginStatus.classList.remove("error");
   readBalances({ hold: walkHeld, keepPicks: walkHeld });
 });
 
@@ -428,8 +752,57 @@ restartButton.addEventListener("click", () => {
   if (walking) return;
   walkHeld = false;
   plan.replaceChildren();
+  beginStatus.classList.remove("error");
   beginStatus.textContent = "Reading.";
   readBalances({ keepPicks: true });
+});
+
+devReturn?.addEventListener("click", async () => {
+  if (walking || !isDevHost(location.hostname)) return;
+  const picked = chosenBase();
+  if (picked.error) {
+    beginStatus.textContent = picked.error;
+    beginStatus.classList.add("error");
+    return;
+  }
+  walking = true;
+  syncBegin();
+  beginStatus.classList.remove("error");
+  beginStatus.textContent = "Asking the light client.";
+  let detail = "";
+  let failed = false;
+  try {
+    detail = await returnOsmosisToPenumbra({
+      amountOsmosis: picked.chosen.osmosis || "0",
+      addresses: snapshot().addresses,
+    }, {
+      ...liveIo(),
+      onProgress(text) {
+        beginStatus.classList.remove("error");
+        beginStatus.textContent = text;
+      },
+    });
+    beginStatus.textContent = detail;
+  } catch (error) {
+    failed = true;
+    detail = error instanceof Error ? error.message : String(error);
+    beginStatus.textContent = detail;
+    beginStatus.classList.add("error");
+  } finally {
+    walking = false;
+    try {
+      await readBalances({ hold: true, keepPicks: true });
+    } finally {
+      beginStatus.textContent = detail;
+      beginStatus.classList.toggle("error", failed);
+      if (walkHeld) beginButton.disabled = true;
+      else syncBegin();
+      if (accountsDirty) {
+        accountsDirty = false;
+        tickAccounts(true);
+      }
+    }
+  }
 });
 
 beginButton.addEventListener("click", async () => {
@@ -442,6 +815,7 @@ beginButton.addEventListener("click", async () => {
   walking = true;
   walkHeld = false;
   syncBegin();
+  beginStatus.classList.remove("error");
   beginStatus.textContent = "Signing.";
   try {
     await walkMigration({
@@ -462,6 +836,10 @@ beginButton.addEventListener("click", async () => {
       await readBalances({ hold: true, keepPicks: true });
     } finally {
       beginButton.disabled = true;
+      if (accountsDirty) {
+        accountsDirty = false;
+        tickAccounts(true);
+      }
     }
   }
 });

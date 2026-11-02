@@ -6,7 +6,7 @@
 // read. Chains are enabled if Keplr already has them. This page does not
 // suggest a chain, because that would hand Keplr a direct RPC URL.
 
-import { createViewClient, diversifiedAddress } from "./zafu.js";
+import { createPenumbraClients, diversifiedAddress } from "./zafu.js";
 
 const PENUMBRA = Symbol.for("penumbra");
 const KEPLR_CHAINS = [
@@ -35,9 +35,9 @@ export async function connectZafu() {
     portPromise?.then((port) => port.close()).catch(() => {});
   };
   try {
-    const view = createViewClient(getPort);
+    const { view, channels, clients } = createPenumbraClients(getPort);
     const address = await diversifiedAddress(view);
-    return { installed: true, connected: true, origin, address, view, close };
+    return { installed: true, connected: true, origin, address, view, channels, clients, close };
   } catch (error) {
     close();
     throw error;
@@ -46,6 +46,51 @@ export async function connectZafu() {
 
 export function keplrInstalled() {
   return Boolean(globalThis.keplr);
+}
+
+// The button is the toggle. The detail is only for a wallet that is not there.
+export function walletToggle(name, connection) {
+  if (connection?.installed === false) {
+    return {
+      label: `Connect ${name}`,
+      disabled: false,
+      title: `${name} is not installed.`,
+      detail: "Not installed.",
+    };
+  }
+  if (connection?.connected) {
+    return { label: `Disconnect ${name}`, disabled: false, title: "", detail: "" };
+  }
+  return { label: `Connect ${name}`, disabled: false, title: "", detail: "" };
+}
+
+export function keplrFingerprint(keys) {
+  return (keys || [])
+    .map((key) => `${key.chainId}:${key.bech32Address || ""}:${key.ethereumHexAddress || ""}`)
+    .join("|");
+}
+
+// Read the enabled keys again. A thrown getKey means the wallet is locked or
+// the chain is not enabled. That is not an account change.
+export async function readKeplrKeys() {
+  const keplr = globalThis.keplr;
+  if (!keplr?.getKey) return null;
+  const keys = [];
+  for (const chain of KEPLR_CHAINS) {
+    try {
+      const key = await keplr.getKey(chain.chainId);
+      keys.push({
+        ...chain,
+        bech32Address: key.bech32Address,
+        ethereumHexAddress: key.ethereumHexAddress || "",
+        name: key.name,
+        error: null,
+      });
+    } catch {
+      return null;
+    }
+  }
+  return keys;
 }
 
 export async function connectKeplr() {

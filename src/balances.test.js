@@ -154,6 +154,7 @@ describe("prepare", () => {
       prep.steps.filter((step) => step.title.startsWith("Leave")).map((step) => step.title),
       ["Leave Penumbra, 1 of 2", "Leave Penumbra, 2 of 2"],
     );
+    assert.deepEqual(prep.steps.map((step) => step.id), ["leave", "leave", "wipe"]);
   });
 
   it("moves the selected amount and leaves the rest", () => {

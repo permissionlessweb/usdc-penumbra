@@ -55,17 +55,12 @@ describe("splitAmount", () => {
 });
 
 describe("steps", () => {
-  it("slices only the exit, and the exit key is not wiped until the deposit", () => {
+  it("slices only the exit, and the slice deposits itself", () => {
     const exitRun = initRun(base);
     assert.equal(exitRun.slices, 3);
     assert.equal(exitRun.intervalSec, 60);
     assert.deepEqual(exitRun.steps.map((step) => step.id), ["leave"]);
-    assert.deepEqual(exitRun.onceSteps.map((step) => step.id), [
-      "cctp-noble",
-      "cctp-forward",
-      "deposit",
-      "wipe",
-    ]);
+    assert.deepEqual(exitRun.onceSteps.map((step) => step.id), ["wipe"]);
     const parts = exitRun.amounts.map((part) => BigInt(part));
     assert.equal(parts.reduce((sum, part) => sum + part, 0n), 100000000n);
 
@@ -116,22 +111,14 @@ describe("steps", () => {
     ]);
 
     const fromPenumbra = { ...exitOnly, injGasShort: true };
-    assert.deepEqual(ids(fromPenumbra), [
-      "leave",
-      "gas-osmosis",
-      "cctp-noble",
-      "cctp-forward",
-      "deposit",
-      "wipe",
-    ]);
-    assert.equal(ids(fromPenumbra).filter((id) => id === "gas-osmosis").length, 1);
+    assert.deepEqual(ids(fromPenumbra), ["leave", "wipe"]);
+    assert.equal(ids(fromPenumbra).includes("gas-osmosis"), false);
 
     const both = { penumbra: true, noble: true, osmosis: true, usdcInj: false, injGasShort: true };
     assert.deepEqual(ids(both), [
       "leave",
       "gas-osmosis",
       "gather-osmosis",
-      "gather-exit",
       "cctp-noble",
       "cctp-forward",
       "deposit",
@@ -152,7 +139,7 @@ describe("steps", () => {
   it("keeps a small selection when the Injective fee is short", () => {
     const short = { ...exitOnly, injGasShort: true, amountOut: "250000", slices: 1, intervalSec: 0, jitterMaxSec: 0 };
     const run = initRun(short);
-    assert.equal(run.onceSteps[0].id, "gas-osmosis");
+    assert.equal(run.onceSteps[0].id, "wipe");
     assert.equal(migrateAmount({ ...exitOnly, injGasShort: true }, "250000", "0", "0"), "250000");
     assert.equal(migrateAmount({ ...exitOnly, injGasShort: true }, "100000", "150000", "0"), "100000");
     assert.equal(migrateAmount({ ...exitOnly, injGasShort: true }, "250001", "0", "0"), "250001");
@@ -162,7 +149,7 @@ describe("steps", () => {
     assert.deepEqual(keysForStep("cctp-noble"), ["noble", "avalanche"]);
     assert.deepEqual(keysForStep("cctp-noble", exitOnly), ["avalanche"]);
     assert.deepEqual(keysForStep("cctp-forward"), ["injLeave"]);
-    assert.deepEqual(keysForStep("leave"), ["exitNoble"]);
+    assert.deepEqual(keysForStep("leave"), []);
     assert.deepEqual(keysForStep("gather-osmosis", { osmosis: true }), ["noble"]);
     assert.deepEqual(keysForStep("gather-osmosis", { penumbra: true, osmosis: true }), []);
     assert.deepEqual(keysForStep("gas-osmosis"), []);
@@ -172,9 +159,9 @@ describe("steps", () => {
 });
 
 describe("reduce", () => {
-  it("acks a slice, waits, and reuses the same Noble receiver", () => {
+  it("acks a slice and waits", () => {
     let run = reduce(initRun(base), { type: "START" });
-    assert.deepEqual(keysNeeded(run), ["exitNoble"]);
+    assert.deepEqual(keysNeeded(run), []);
     run = reduce(run, { type: "NOTE", role: "exitNoble", address: "noble1abc", keyId: "k1" });
     assert.deepEqual(keysNeeded(run), []);
     run = reduce(run, { type: "ACK" });
@@ -217,7 +204,9 @@ describe("reduce", () => {
   });
 
   it("runs the gas hop once, not on every slice", () => {
-    const run = initRun({ ...base, injGasShort: true });
+    const penumbraOnly = initRun({ ...base, injGasShort: true });
+    assert.equal(penumbraOnly.onceSteps.filter((step) => step.id === "gas-osmosis").length, 0);
+    const run = initRun({ ...base, noble: true, amountIn: "10", injGasShort: true });
     assert.equal(run.exitSteps.some((step) => step.id === "gas-osmosis"), false);
     assert.equal(run.onceSteps.filter((step) => step.id === "gas-osmosis").length, 1);
     let state = apply(run, [{ type: "START" }, { type: "ACK" }]);
@@ -253,10 +242,12 @@ describe("messages", () => {
     };
     assert.equal(migrateAmount(findings, ctx.amountOut, ctx.amountIn, "0"), "150000000");
     const leave = describeStep("leave", ctx);
+    assert.equal(leave.messages.length, 2);
     assert.equal(leave.messages[0].type, "penumbra-withdraw");
-    assert.equal(leave.messages[0].value.amount, "33333333");
-    assert.equal(leave.messages[0].value.to, "USDC.noble");
-    assert.equal(leave.messages[0].value.receiver, "noble1out");
+    assert.equal(leave.messages[0].value.to, "INJ");
+    assert.equal(leave.messages[0].value.receiver, "a new Injective account");
+    assert.equal(leave.messages[1].value.to, "USDC.inj");
+    assert.equal(leave.messages[1].value.amount, "the remainder");
     assert.deepEqual(signingGaps(leave.messages), []);
 
     const burn = describeStep("cctp-noble", ctx);
@@ -265,7 +256,7 @@ describe("messages", () => {
     assert.equal(burn.messages[0].value.asset, "USDC.noble");
     assert.equal(burn.messages[0].value.fromChainId, "noble-1");
     assert.equal(burn.messages[0].value.toChainId, "43114");
-    assert.equal(burn.messages[0].value.amount, "150000000");
+    assert.equal(burn.messages[0].value.amount, "50000000");
     assert.equal(burn.messages[0].value.signer, "noble1q");
     assert.equal(burn.messages[0].value.mint_recipient, "0xabc");
 
@@ -277,14 +268,14 @@ describe("messages", () => {
     assert.equal(forward.messages[2].type, "transferAssetRelease");
     assert.equal(forward.messages[2].value.denom, RELEASE_DENOM);
     assert.equal(forward.messages[2].value.asset, "USDC.inj");
-    assert.equal(forward.messages[2].value.amount, "150000000");
+    assert.equal(forward.messages[2].value.amount, "50000000");
     assert.equal(forward.messages[2].value.released, true);
     assert.equal(forward.messages[2].value.recipient, "0xdef");
 
     const deposit = describeStep("deposit", ctx);
     assert.equal(deposit.messages[0].value.sender, "inj1l");
     assert.equal(deposit.messages[0].value.token.denom, INJ_USDC_DENOM);
-    assert.equal(deposit.messages[0].value.token.amount, "150000000");
+    assert.equal(deposit.messages[0].value.token.amount, "50000000");
     assert.equal(deposit.messages[0].value.receiver, ZAFU_RECEIVER);
     const namedReceiver = describeStep("deposit", {
       ...ctx,

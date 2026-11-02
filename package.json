@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node --test src/machine.test.js src/zafu.test.js src/balances.test.js src/tx.test.js src/circle.test.js src/walk.test.js && node build.mjs && node --test dist/custody.test.js"
+    "test": "node --test src/machine.test.js src/wallets.test.js src/zafu.test.js src/balances.test.js src/tx.test.js src/circle.test.js src/batch.test.js src/walk.test.js && node build.mjs && node --test dist/custody.test.js"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^1.10.1",

@@ -366,6 +366,7 @@ header { display: flex; justify-content: space-between; align-items: baseline; }
   padding: 4px 6px;
 }
 #begin-status { margin: 8px 0 0; color: var(--muted); min-height: 1.2em; }
+#begin-status.error { color: var(--fail); }
 #plan { margin: 12px 0 0; padding-left: 0; list-style: none; }
 #plan:empty { display: none; }
 #plan li { margin: 4px 0; }

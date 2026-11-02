@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { keccak_256 } from "@noble/hashes/sha3";
+import { sha256 } from "@noble/hashes/sha2";
 import {
   GAS,
+  directSignBytes,
+  directSignDigest,
   encodeMessage,
   fee,
   pollTx,
   signAndBroadcast,
+  signAndBroadcastLocal,
 } from "./tx.js";
 
 const mint = "AAAAAAAAAAAAAAAAga8VDSpX1SZ/mDgerSSO7C9jhW8=";
@@ -198,6 +203,169 @@ describe("sign", () => {
         { now: () => now, sleep: async (ms) => { now += ms; }, timeoutMs: 5, intervalMs: 5 },
       ),
       /not found/,
+    );
+  });
+
+  it("reports a rejected broadcast without waiting for a block", async () => {
+    const progress = [];
+    let polls = 0;
+    await assert.rejects(
+      () => signAndBroadcast({
+        keplr: {
+          async getKey() {
+            return { pubKey: new Uint8Array(33).fill(2) };
+          },
+          async signDirect() {
+            return { signature: { signature: new Uint8Array(64).fill(3) } };
+          },
+          async sendTx() {
+            const error = { code: 1, log: "error handling packet: see events for details" };
+            throw error;
+          },
+        },
+        chainId: "osmosis-1",
+        signer: "osmo1sender",
+        messages: [{
+          type: "/ibc.applications.transfer.v1.MsgTransfer",
+          value: {
+            source_channel: "channel-750",
+            token: { denom: "uusdc", amount: "1" },
+            sender: "osmo1sender",
+            receiver: "pfm",
+            timeout_timestamp: 5n,
+          },
+        }],
+        feeAmount: fee("osmosis-1", GAS.hook),
+        lcd: "https://lcd.example",
+        onSubmitted(hash) { progress.push(hash); },
+        wait: { now: () => 0, sleep: async () => { polls += 1; }, timeoutMs: 1000, intervalMs: 100 },
+        fetchImpl: async (url) => {
+          if (String(url).includes("/accounts/")) {
+            return { ok: true, json: async () => ({ account: { account_number: "1", sequence: "0" } }) };
+          }
+          polls += 1;
+          return { ok: true, json: async () => ({ tx_response: { code: 0, height: "1", raw_log: "" } }) };
+        },
+      }),
+      /The transaction failed \(1\)\. error handling packet: see events for details/,
+    );
+    assert.equal(polls, 0);
+    assert.deepEqual(progress, []);
+  });
+
+  it("keeps an event reason from a checked failure", async () => {
+    let now = 0;
+    const seen = [];
+    await assert.rejects(
+      () => signAndBroadcast({
+        keplr: keplr(),
+        chainId: "osmosis-1",
+        signer: "osmo1sender",
+        messages: [{
+          type: "/ibc.applications.transfer.v1.MsgTransfer",
+          value: {
+            source_channel: "channel-750",
+            token: { denom: "uusdc", amount: "1" },
+            sender: "osmo1sender",
+            receiver: "pfm",
+            timeout_timestamp: 5n,
+          },
+        }],
+        feeAmount: fee("osmosis-1", GAS.hook),
+        lcd: "https://lcd.example",
+        onSubmitted(hash) { seen.push(hash); },
+        wait: { now: () => now, sleep: async (ms) => { now += ms; }, timeoutMs: 1000, intervalMs: 100 },
+        fetchImpl: async (url) => {
+          if (String(url).includes("/accounts/")) {
+            return { ok: true, json: async () => ({ account: { account_number: "1", sequence: "0" } }) };
+          }
+          return {
+            ok: true,
+            json: async () => ({
+              tx_response: {
+                code: 1,
+                height: "12",
+                raw_log: "error handling packet: see events for details",
+                events: [{ type: "error", attributes: [{ key: "ZXJyb3I=", value: "aW52YWxpZCByZWNlaXZlcg==" }] }],
+              },
+            }),
+          };
+        },
+      }),
+      /The transaction failed \(1\)\. error handling packet: see events for details invalid receiver/,
+    );
+    assert.equal(seen.length, 1);
+    assert.match(seen[0], /^[0-9A-F]+$/);
+  });
+});
+
+describe("local injective signature", () => {
+  const body = new Uint8Array([1, 2, 3]);
+  const auth = new Uint8Array([4, 5]);
+
+  it("hashes the direct sign doc with keccak256", () => {
+    const raw = directSignBytes(body, auth, "injective-1", "8");
+    const digest = directSignDigest(body, auth, "injective-1", "8");
+    assert.equal(Buffer.from(digest).equals(Buffer.from(keccak_256(raw))), true);
+    assert.equal(Buffer.from(keccak_256(raw)).equals(Buffer.from(sha256(raw))), false);
+  });
+
+  it("broadcasts the signed bytes and stops when the account is missing", async () => {
+    let now = 0;
+    let posted = null;
+    let digest = null;
+    const result = await signAndBroadcastLocal({
+      chainId: "injective-1",
+      signer: "inj1hop",
+      messages: [{
+        type: "/ibc.applications.transfer.v1.MsgTransfer",
+        value: {
+          source_channel: "channel-494",
+          token: { denom: "erc20:0xa00C59fF5a080D2b954d0c75e46E22a0c371235a", amount: "5" },
+          sender: "inj1hop",
+          receiver: "penumbra1qq",
+          timeout_timestamp: 9n,
+        },
+      }],
+      feeAmount: fee("injective-1", GAS.deposit),
+      lcd: "https://lcd.injective.network",
+      pubKey: new Uint8Array(33).fill(2),
+      signDigest: async (value) => {
+        digest = value;
+        return new Uint8Array(65).fill(6);
+      },
+      wait: { now: () => now, sleep: async (ms) => { now += ms; }, timeoutMs: 1000, intervalMs: 100 },
+      fetchImpl: async (url, init) => {
+        if (String(url).includes("/accounts/")) {
+          return { ok: true, json: async () => ({ account: { base_account: { account_number: "4", sequence: "1" } } }) };
+        }
+        if (init?.method === "POST") {
+          posted = JSON.parse(init.body);
+          return { ok: true, json: async () => ({ tx_response: { code: 0, txhash: "AB", raw_log: "" } }) };
+        }
+        return { ok: true, json: async () => ({ tx_response: { code: 0, height: "9", raw_log: "" } }) };
+      },
+    });
+    assert.equal(result.hash, "AB");
+    assert.equal(digest.length, 32);
+    assert.equal(posted.mode, "BROADCAST_MODE_SYNC");
+    assert.equal(typeof posted.tx_bytes, "string");
+    await assert.rejects(
+      () => signAndBroadcastLocal({
+        chainId: "injective-1",
+        signer: "inj1missing",
+        messages: [{
+          type: "/cosmos.bank.v1beta1.MsgSend",
+          value: { from_address: "inj1missing", to_address: "inj1other", amount: [{ denom: "inj", amount: "1" }] },
+        }],
+        feeAmount: fee("injective-1", GAS.deposit),
+        lcd: "https://lcd.injective.network",
+        pubKey: new Uint8Array(33).fill(2),
+        signDigest: async () => new Uint8Array(65),
+        wait: { now: () => 0, sleep: async () => {}, timeoutMs: 1, intervalMs: 1 },
+        fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+      }),
+      /has not been created/,
     );
   });
 });

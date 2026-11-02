@@ -3,12 +3,66 @@ import { describe, it } from "node:test";
 import { ORBITER } from "./circle.js";
 import { INJ_ON_OSMOSIS, INJ_USDC_DENOM, OSMOSIS_USDC_DENOM, RELEASE_DENOM } from "./route.js";
 import { GAS, fee } from "./tx.js";
-import { performStep, routesFromExactOut, walkMigration } from "./walk.js";
+import { performStep, returnOsmosisToPenumbra, routesFromExactOut, walkMigration } from "./walk.js";
 
 const INJ_FEE = fee("injective-1", GAS.deposit).amount;
 
 const mint = "AAAAAAAAAAAAAAAAga8VDSpX1SZ/mDgerSSO7C9jhW8=";
 const caller = "AAAAAAAAAAAAAAAA+XAYmOelQwKNR6ORO8GRyuc3EzQ=";
+
+function readVarint(bytes, offset) {
+  let value = 0n;
+  let shift = 0n;
+  let cursor = offset;
+  while (cursor < bytes.length) {
+    const byte = bytes[cursor];
+    cursor += 1;
+    value |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return { value, offset: cursor };
+    shift += 7n;
+    if (shift > 70n) break;
+  }
+  throw new Error("A protobuf field was cut off.");
+}
+
+function readFields(bytes) {
+  const fields = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    const key = readVarint(bytes, offset);
+    offset = key.offset;
+    const field = Number(key.value >> 3n);
+    const wire = Number(key.value & 7n);
+    if (wire === 0) {
+      const body = readVarint(bytes, offset);
+      offset = body.offset;
+      fields.push({ field, wire, value: body.value });
+      continue;
+    }
+    if (wire !== 2) throw new Error(`A protobuf field used wire ${wire}.`);
+    const length = readVarint(bytes, offset);
+    offset = length.offset;
+    const end = offset + Number(length.value);
+    fields.push({ field, wire, value: bytes.subarray(offset, end) });
+    offset = end;
+  }
+  return fields;
+}
+
+function textField(fields, field) {
+  const found = fields.find((item) => item.field === field && item.wire === 2);
+  if (!found) throw new Error(`Protobuf field ${field} is missing.`);
+  return new TextDecoder().decode(found.value);
+}
+
+function transferMessage(body) {
+  const packed = readFields(body).filter((item) => item.field === 1);
+  assert.equal(packed.length, 1);
+  const any = readFields(packed[0].value);
+  assert.equal(textField(any, 1), "/ibc.applications.transfer.v1.MsgTransfer");
+  const value = any.find((item) => item.field === 2);
+  return readFields(value.value);
+}
 
 function indexOfBytes(haystack, needle) {
   for (let index = 0; index <= haystack.length - needle.length; index += 1) {
@@ -39,6 +93,7 @@ function harness(seed, options = {}) {
   const sleeps = [];
   let now = 1_000_000;
   let penumbra = options.penumbra ?? "0";
+  let nobleHeld = options.noble ?? "0";
   let wiped = 0;
   const io = {
     now: () => now,
@@ -57,7 +112,7 @@ function harness(seed, options = {}) {
         return response({ account: { account_number: "1", sequence: "0" } });
       }
       if (text.includes("/cosmos/tx/v1beta1/txs/")) {
-        return response({ tx_response: { code: 0, height: "8", raw_log: "" } });
+        return response(options.txResult || { tx_response: { code: 0, height: "8", raw_log: "" } });
       }
       if (text.includes("/cosmos/bank/v1beta1/balances/")) {
         const parsed = new URL(text);
@@ -108,7 +163,7 @@ function harness(seed, options = {}) {
     },
     penumbraUsdc: async () => {
       options.onPenumbraRead?.();
-      return { amount: penumbra, decimals: 6 };
+      return { amount: nobleHeld, noble: nobleHeld, inj: penumbra, decimals: 6 };
     },
     quote: options.quoteFn,
     view: options.view,
@@ -121,6 +176,7 @@ function harness(seed, options = {}) {
     balances,
     wiped: () => wiped,
     setPenumbra(amount) { penumbra = amount; },
+    setNoble(amount) { nobleHeld = amount; },
     penumbra: () => penumbra,
   };
 }
@@ -283,6 +339,37 @@ describe("quote", () => {
     assert.throws(
       () => routesFromExactOut({ amount_in: "0", amount_out: { denom: INJ_ON_OSMOSIS, amount: "1" }, route: [] }),
       /did not quote/,
+    );
+  });
+
+  it("reverses an exact-out quote listed from INJ back to USDC", () => {
+    const allUsdc = "factory/osmo147h5x9pcj7lm0cttlaefx6sqq5vdfnmwfcqxkmjd7exqm9gc7grqhr75m0/alloyed/allUSDC";
+    const parsed = routesFromExactOut({
+      amount_in: "465",
+      amount_out: { denom: INJ_ON_OSMOSIS, amount: "64000000000000" },
+      route: [{
+        pools: [
+          { id: 11, token_in_denom: allUsdc },
+          { id: 9, token_in_denom: OSMOSIS_USDC_DENOM },
+        ],
+      }],
+    });
+    assert.deepEqual(parsed.routes, [
+      { pool_id: 9, token_in_denom: OSMOSIS_USDC_DENOM },
+      { pool_id: 11, token_in_denom: allUsdc },
+    ]);
+    assert.equal(parsed.amountIn, "465");
+    assert.equal(parsed.amountOut, "64000000000000");
+    assert.throws(
+      () => routesFromExactOut({
+        amount_in: "465",
+        amount_out: { denom: INJ_ON_OSMOSIS, amount: "64000000000000" },
+        route: [{ pools: [
+          { id: 11, token_in_denom: allUsdc },
+          { id: 9, token_in_denom: "uosmo" },
+        ] }],
+      }),
+      /did not quote the INJ swap/,
     );
   });
 });
@@ -575,8 +662,9 @@ describe("walk", () => {
       addresses: accounts,
     }, box.io);
     assert.deepEqual(box.sends, ["injective-1"]);
-    assert.match(seen[0], /Asking Zafu\. Penumbra USDC is 1 USDC\./);
-    assert.match(detail, /Penumbra holds 2\.5 USDC, up from 1 USDC\./);
+    assert.match(seen[0], /Submitted [0-9A-F]+\. Waiting for Injective\./);
+    assert.match(seen.find((line) => line.startsWith("Asking Zafu")) || "", /Asking Zafu\. Penumbra USDC\.inj is 1 USDC\.inj\./);
+    assert.match(detail, /Penumbra holds 2\.5 USDC\.inj, up from 1 USDC\.inj\./);
   });
 
   it("walks an Osmosis balance through the burn and one deposit", async () => {
@@ -690,23 +778,43 @@ describe("walk", () => {
   });
 
   it("leaves on the channel Zafu names, then waits between slices", async () => {
-    let planner;
+    const plans = [];
+    const asset = new Uint8Array([9]);
+    const returnAddress = { inner: new Uint8Array([1]) };
     const view = {
       balances: async function* balances() {
         yield {
           balanceView: {
             valueView: {
               case: "knownAssetId",
-              value: { metadata: { symbol: "USDC", base: "transfer/channel-9/uusdc" } },
+              value: {
+                metadata: {
+                  symbol: "USDC",
+                  base: "transfer/channel-9/uusdc",
+                  penumbraAssetId: { inner: asset },
+                },
+              },
             },
           },
         };
       },
       async ephemeralAddress() {
-        return { address: { inner: new Uint8Array([1]) } };
+        return { address: returnAddress };
+      },
+      async gasPrices() {
+        return {
+          gasPrices: { blockSpacePrice: 999999n },
+          altGasPrices: [{
+            assetId: { inner: asset },
+            blockSpacePrice: 0n,
+            compactBlockSpacePrice: 0n,
+            verificationPrice: 0n,
+            executionPrice: 0n,
+          }],
+        };
       },
       async transactionPlanner(request) {
-        planner = request;
+        plans.push(request);
         return { plan: { ok: true } };
       },
       async *authorizeAndBuild() {
@@ -738,44 +846,172 @@ describe("walk", () => {
       /did not name a return channel/,
     );
 
-    const box = harness({}, {
-      view,
-      onSend() {},
+    const quoted = harness({}, { view, quote: exactOut("100", INJ_FEE) });
+    const dropped = [];
+    quoted.io.issueHop = async () => ({ keyId: "early", address: "inj1early", ethereum: "0x2222222222222222222222222222222222222222" });
+    quoted.io.signHop = async () => { throw new Error("deposit should not run"); };
+    quoted.io.wipeKey = (id) => dropped.push(id);
+    const originalQuote = quoted.io.fetch;
+    quoted.io.fetch = async (url, init) => {
+      if (String(url).includes("/router/quote")) return response(exactOut("100", "10"));
+      return originalQuote(url, init);
+    };
+    await assert.rejects(
+      () => performStep({ id: "leave" }, { amounts: ["1000"], sliceIndex: 0 }, {
+        findings: { penumbra: true },
+        addresses: accounts,
+      }, quoted.io),
+      /did not quote the INJ swap/,
+    );
+    assert.deepEqual(dropped, ["early"]);
+
+    const untimed = harness({}, { view, quote: exactOut("100", INJ_FEE) });
+    const wipedHeight = [];
+    untimed.io.issueHop = async () => ({
+      keyId: "noheight",
+      address: "inj1early",
+      ethereum: "0x2222222222222222222222222222222222222222",
     });
-    box.io.fetch = async (url) => {
-      const text = String(url);
-      if (text.includes("/balances/")) {
-        const amount = box.sends.includes("broadcast") ? "1000" : "0";
-        return response({ balance: { denom: "uusdc", amount } });
-      }
-      return response({ account: { account_number: "1", sequence: "0" } });
+    untimed.io.signHop = async () => { throw new Error("deposit should not run"); };
+    untimed.io.wipeKey = (id) => wipedHeight.push(id);
+    await assert.rejects(
+      () => performStep({ id: "leave" }, { amounts: ["1000"], sliceIndex: 0 }, {
+        findings: { penumbra: true },
+        addresses: accounts,
+      }, untimed.io),
+      /did not name a Noble height/,
+    );
+    assert.deepEqual(wipedHeight, ["noheight"]);
+
+    const partialPlans = [];
+    const partialView = {
+      ...view,
+      async transactionPlanner(request) {
+        partialPlans.push(request);
+        if (partialPlans.length > 1) throw new Error("second plan failed");
+        return { plan: { ok: true } };
+      },
+    };
+    const partial = harness({}, { view: partialView, quote: exactOut("100", INJ_FEE) });
+    const kept = [];
+    partial.io.issueHop = async () => ({
+      keyId: "partial",
+      address: "inj1early",
+      ethereum: "0x2222222222222222222222222222222222222222",
+    });
+    partial.io.signHop = async () => { throw new Error("deposit should not run"); };
+    partial.io.wipeKey = (id) => kept.push(id);
+    partial.io.channels = {
+      async channelClientState() {
+        return {
+          identifiedClientState: {
+            clientId: "07-tendermint-4",
+            clientState: {
+              unpackTo(target) {
+                target.chainId = "noble-1";
+                target.latestHeight = { revisionNumber: 4n, revisionHeight: 80n };
+                return true;
+              },
+            },
+          },
+        };
+      },
+    };
+    partial.io.clients = { clientStatus: async () => ({ status: "Active" }) };
+    await assert.rejects(
+      () => performStep({ id: "leave" }, { amounts: ["1000"], sliceIndex: 0 }, {
+        findings: { penumbra: true },
+        addresses: accounts,
+      }, partial.io),
+      /fee withdrawal was already sent/,
+    );
+    assert.deepEqual(kept, []);
+    assert.equal(partialPlans.length, 2);
+    assert.equal(partialPlans[0].ics20Withdrawals.length, 1);
+
+    const box = harness({}, { view, quote: exactOut("100", INJ_FEE) });
+    const issued = [];
+    const deposits = [];
+    let shielded = 0n;
+    box.io.issueHop = async () => {
+      const hop = {
+        keyId: `k${issued.length}`,
+        address: `inj1hop${issued.length}`,
+        ethereum: "0x2222222222222222222222222222222222222222",
+      };
+      issued.push(hop);
+      return hop;
+    };
+    box.io.wipeKey = (id) => dropped.push(id);
+    let askedChannel = "";
+    box.io.channels = {
+      async channelClientState({ channelId }) {
+        askedChannel = channelId;
+        return {
+          identifiedClientState: {
+            clientId: "07-tendermint-4",
+            clientState: {
+              unpackTo(target) {
+                target.chainId = "noble-1";
+                target.latestHeight = { revisionNumber: 4n, revisionHeight: 80n };
+                return true;
+              },
+            },
+          },
+        };
+      },
+    };
+    box.io.clients = { clientStatus: async () => ({ status: "Active" }) };
+    box.io.signHop = async (request) => {
+      deposits.push(request);
+      shielded += 900n;
+      box.setPenumbra(shielded.toString());
+      return { hash: "ABCD" };
     };
     const originalBroadcast = view.broadcastTransaction;
     view.broadcastTransaction = async function* broadcast() {
-      box.sends.push("broadcast");
+      const hop = issued.at(-1);
+      box.balances.set(key(hop.address, "inj"), INJ_FEE);
+      box.balances.set(key(hop.address, INJ_USDC_DENOM), "900");
       yield* originalBroadcast();
     };
     const detail = await performStep({ id: "leave" }, { amounts: ["1000"], sliceIndex: 0 }, {
       findings: { penumbra: true },
       addresses: accounts,
     }, box.io);
-    assert.equal(detail, "Zafu broadcast the withdrawal.");
-    assert.equal(planner.ics20Withdrawals[0].sourceChannel, "channel-9");
-    assert.equal(planner.ics20Withdrawals[0].destinationChainAddress, "noble1user");
-    assert.equal(planner.ics20Withdrawals[0].timeoutTime, 1560n);
-    assert.equal(planner.ics20Withdrawals[0].useTransparentAddress, true);
+    assert.match(detail, /Penumbra holds 0\.0009 USDC\.inj, up from 0 USDC\.inj\. ABCD/);
+    assert.equal(plans.length, 2);
+    assert.equal(plans[0].ics20Withdrawals.length, 1);
+    assert.equal(plans[1].ics20Withdrawals.length, 1);
+    assert.equal(askedChannel, "channel-9");
+    const feeWithdrawal = plans[0].ics20Withdrawals[0];
+    const migration = plans[1].ics20Withdrawals[0];
+    assert.equal(feeWithdrawal.sourceChannel, "channel-9");
+    assert.equal(feeWithdrawal.destinationChainAddress, "pfm");
+    assert.equal(feeWithdrawal.amount.lo, 100n);
+    assert.equal(feeWithdrawal.timeoutTime, 1560000000000n);
+    assert.deepEqual(feeWithdrawal.timeoutHeight, {
+      revisionNumber: 4n,
+      revisionHeight: 1080n,
+    });
+    assert.deepEqual(migration.timeoutHeight, feeWithdrawal.timeoutHeight);
+    assert.equal(migration.timeoutTime, 1560000000000n);
+    assert.equal(feeWithdrawal.useTransparentAddress, true);
+    assert.equal(feeWithdrawal.returnAddress, returnAddress);
+    assert.equal(plans[0].feeMode.case, "autoFee");
+    assert.equal(plans[0].feeMode.value.feeTier, 1);
+    const buy = JSON.parse(feeWithdrawal.ics20Memo);
+    assert.equal(buy.forward.channel, "channel-1");
+    assert.equal(buy.forward.next.wasm.msg.osmosis_swap.receiver, "inj1hop0");
+    assert.equal(buy.forward.next.wasm.msg.osmosis_swap.slippage.min_output_amount, INJ_FEE);
+    assert.equal(migration.destinationChainAddress, ORBITER);
+    assert.equal(migration.amount.lo, 900n);
+    assert.match(migration.ics20Memo, /PROTOCOL_CCTP/);
+    assert.equal(deposits[0].messages[0].value.token.amount, "900");
+    assert.equal(deposits[0].messages[0].value.receiver, "penumbravault");
+    assert.equal(deposits[0].messages[0].value.source_channel, "channel-494");
+    assert.equal(dropped.includes("k0"), true);
 
-    const waited = harness({
-      [key("noble1user", "uusdc")]: "0",
-      [key("inj1user", "inj")]: "1",
-    }, { view });
-    let arrived = 0n;
-    const original = view.broadcastTransaction;
-    view.broadcastTransaction = async function* broadcast() {
-      arrived += 1000n;
-      waited.balances.set(key("noble1user", "uusdc"), arrived.toString());
-      yield* original();
-    };
     const result = await walkMigration({
       input: {
         penumbra: true,
@@ -797,13 +1033,15 @@ describe("walk", () => {
         amountOsmosis: "0",
         addresses: accounts,
       },
-      io: waited.io,
+      io: box.io,
       onUpdate() {},
     });
-    assert.equal(result.status, "halted");
-    assert.match(result.halt.reason, /Noble needs USDC left for the fee/);
-    assert.equal(waited.sleeps.includes(2000), true);
-    assert.equal(waited.wiped(), 1);
+    assert.equal(result.status, "done");
+    assert.equal(box.sleeps.includes(2000), true);
+    assert.equal(issued.length, 3);
+    assert.notEqual(issued[1].address, issued[2].address);
+    assert.equal(deposits.length, 3);
+    assert.equal(box.wiped(), 1);
   });
 
   it("does not sign when the Noble account is missing", async () => {
@@ -824,5 +1062,166 @@ describe("walk", () => {
     assert.match(result.halt.reason, /not connected/);
     assert.deepEqual(box.sends, []);
     assert.equal(box.wiped(), 1);
+  });
+});
+
+function lightClient(chainId = "noble-1") {
+  return {
+    view: {
+      assets: () => (async function* () {
+        yield { denomMetadata: { symbol: "USDC", base: "transfer/channel-4/uusdc" } };
+      })(),
+    },
+    channels: {
+      async channel() {
+        return { channel: { state: 3, counterparty: { channelId: "channel-12" } } };
+      },
+      async channelClientState() {
+        return {
+          identifiedClientState: {
+            clientId: "07-tendermint-1",
+            clientState: {
+              unpackTo(target) {
+                target.chainId = chainId;
+                return true;
+              },
+            },
+          },
+        };
+      },
+    },
+    clients: { clientStatus: async () => ({ status: "Active" }) },
+  };
+}
+
+describe("dev return", () => {
+  it("forwards the selected Osmosis USDC on the light client's channel", async () => {
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
+    }, { onSend() { box.setNoble("1000000"); } });
+    const detail = await returnOsmosisToPenumbra({
+      amountOsmosis: "1000000",
+      addresses: { ...accounts, zafu: "penumbra1vault" },
+    }, { ...box.io, ...lightClient() });
+    assert.match(detail, /Penumbra holds 1 USDC\.noble, up from 0 USDC\.noble\./);
+    assert.deepEqual(box.sends, ["osmosis-1"]);
+    const message = transferMessage(box.bodies[0]);
+    assert.equal(textField(message, 1), "transfer");
+    assert.equal(textField(message, 2), "channel-750");
+    const coin = readFields(message.find((item) => item.field === 3).value);
+    assert.equal(textField(coin, 1), OSMOSIS_USDC_DENOM);
+    assert.equal(textField(coin, 2), "1000000");
+    assert.equal(textField(message, 4), "osmo1user");
+    assert.equal(textField(message, 5), "noble1user");
+    assert.equal(message.some((item) => item.field === 6), false);
+    const timeout = message.find((item) => item.field === 7);
+    assert.equal(timeout.wire, 0);
+    assert.equal(timeout.value > 0n, true);
+    assert.deepEqual(JSON.parse(textField(message, 8)), {
+      forward: {
+        receiver: "penumbra1vault",
+        port: "transfer",
+        channel: "channel-12",
+        timeout: "10m",
+        retries: 2,
+      },
+    });
+    assert.equal(message.some((item) => item.field > 8), false);
+  });
+
+  it("does not sign when the light client names another chain", async () => {
+    const box = harness({ [key("osmo1user", "uosmo")]: "100000" });
+    await assert.rejects(
+      () => returnOsmosisToPenumbra({
+        amountOsmosis: "1000000",
+        addresses: { ...accounts, zafu: "penumbra1vault" },
+      }, { ...box.io, ...lightClient("osmosis-1") }),
+      /did not name a Noble channel/,
+    );
+    assert.deepEqual(box.sends, []);
+  });
+
+  it("does not ask the light client when Osmosis gas is short", async () => {
+    const box = harness({ [key("osmo1user", "uosmo")]: "0" });
+    let asked = 0;
+    const light = lightClient();
+    const channel = light.channels.channel;
+    light.channels.channel = async (request) => {
+      asked += 1;
+      return channel(request);
+    };
+    await assert.rejects(
+      () => returnOsmosisToPenumbra({
+        amountOsmosis: "1000000",
+        addresses: { ...accounts, zafu: "penumbra1vault" },
+      }, { ...box.io, ...light }),
+      /Osmosis gas is short/,
+    );
+    assert.equal(asked, 0);
+    assert.deepEqual(box.sends, []);
+  });
+
+  it("does not sign when no Noble account is connected", async () => {
+    const box = harness({ [key("osmo1user", "uosmo")]: "100000" });
+    let asked = 0;
+    const light = lightClient();
+    const channel = light.channels.channel;
+    light.channels.channel = async (request) => {
+      asked += 1;
+      return channel(request);
+    };
+    await assert.rejects(
+      () => returnOsmosisToPenumbra({
+        amountOsmosis: "1000000",
+        addresses: { ...accounts, userNoble: "", noble: "", zafu: "penumbra1vault" },
+      }, { ...box.io, ...light }),
+      /Noble account is not connected/,
+    );
+    assert.equal(asked, 0);
+    assert.deepEqual(box.sends, []);
+  });
+
+  it("shows an Osmosis packet failure and does not wait on Zafu", async () => {
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+    }, {
+      txResult: {
+        tx_response: {
+          code: 1,
+          height: "11",
+          raw_log: "error handling packet: see events for details",
+          events: [{ type: "error", attributes: [{ key: "error", value: "invalid receiver" }] }],
+        },
+      },
+    });
+    const progress = [];
+    let reads = 0;
+    const light = lightClient();
+    await assert.rejects(
+      () => returnOsmosisToPenumbra({
+        amountOsmosis: "1000000",
+        addresses: { ...accounts, zafu: "penumbra1vault" },
+      }, {
+        ...box.io,
+        ...light,
+        onProgress(text) { progress.push(text); },
+        penumbraUsdc: async () => {
+          reads += 1;
+          return { amount: "0", noble: "0", inj: "0", decimals: 6 };
+        },
+      }),
+      (error) => {
+        assert.match(error.message, /The transaction failed \(1\)/);
+        assert.match(error.message, /error handling packet: see events for details/);
+        assert.match(error.message, /invalid receiver/);
+        assert.match(error.message, /transfer\/channel-750 to noble1user/);
+        assert.match(error.message, /Osmosis still holds this USDC/);
+        return true;
+      },
+    );
+    assert.equal(reads, 1);
+    assert.equal(box.sends.length, 1);
+    assert.equal(progress.some((line) => /^Submitted [0-9A-F]+/.test(line) && line.includes("Waiting for Osmosis")), true);
   });
 });

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { heldCount, holds, issue, wipe } from "./custody.js";
+import { verify } from "@noble/secp256k1";
+import { heldCount, holds, issue, publicKeyOf, signDigest, wipe } from "./custody.js";
 
 describe("custody", () => {
   it("derives a fresh cosmes address per hop and drops the key on wipe", () => {
@@ -23,7 +24,14 @@ describe("custody", () => {
     wipe(first.keyId);
     assert.equal(holds(first.keyId), false);
     assert.equal(heldCount(), 4);
+    const digest = new Uint8Array(32).fill(7);
+    const signature = signDigest(inj.keyId, digest);
+    assert.equal(signature.length, 65);
+    assert.equal(signature[64] === 0 || signature[64] === 1, true);
+    assert.equal(verify(signature.subarray(0, 64), digest, publicKeyOf(inj.keyId)), true);
+    assert.equal("privateKey" in inj, false);
     for (const key of [second, noble, inj, avalanche]) wipe(key.keyId);
     assert.equal(heldCount(), 0);
+    assert.throws(() => signDigest(inj.keyId, digest), /cannot hold the Injective key/);
   });
 });

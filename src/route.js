@@ -1,8 +1,10 @@
 // Balances select the actions. The person chooses how much of each balance to move.
 //
 // USDC in Penumbra leaves in slices. The interval and the optional buffer
-// belong only to that exit. The USDC.noble that comes out is migrated and
-// deposited back to a diversified address of the same Zafu account.
+// belong only to that exit. Each slice is two withdrawals, each its own signature.
+// One buys INJ for a new Injective account. The other burns the rest to that
+// account. That account deposits to one diversified address. The next slice
+// uses a new Injective account. docs/batch-out.md is the flow.
 // USDC.noble that is already outside Penumbra migrates in one move.
 // USDC already on Injective deposits in one move.
 //
@@ -11,11 +13,12 @@
 // that same transfer: the memo burns it on arrival. That bridge does not sell
 // the USDC into an Osmosis pool.
 //
-// When the Injective wallet cannot pay the IBC into Penumbra, quote the
-// shortfall on Osmosis and bridge that INJ to the wallet. The hop is the first
-// return step. Penumbra slices still leave before it. The pool is quoted when
-// that swap is signed. Circle's burn is quoted when that step runs. The
-// connected Keplr account signs. This page does not issue a hop key.
+// When the user's Injective wallet cannot pay the IBC, and the USDC is already
+// outside Penumbra, quote the shortfall on Osmosis and bridge that INJ to the
+// wallet. That hop is the first return step. A Penumbra slice buys INJ for its
+// own account and does not use this hop. The pool is quoted when that swap is
+// signed. Circle's burn is quoted when that step runs. The connected Keplr
+// account signs the steps that start outside Penumbra.
 
 export const RELEASE_DENOM = "0xa00C59fF5a080D2b954d0c75e46E22a0c371235a";
 export const RELEASE_CHAIN = "1776";
@@ -52,6 +55,14 @@ export function migrateAmount(findings, amountOut, amountIn, amountOsmosis = "0"
   return total.toString();
 }
 
+// USDC that is already outside Penumbra. A Penumbra slice migrates itself.
+export function outsideAmount(findings, amountIn, amountOsmosis = "0") {
+  let total = 0n;
+  if (findings.noble) total += BigInt(amountIn || "0");
+  if (findings.osmosis) total += BigInt(amountOsmosis || "0");
+  return total.toString();
+}
+
 export function blockReason(findings) {
   const pays = findings.penumbra || findings.noble || findings.osmosis;
   if (!pays && !findings.usdcInj) return NO_USDC;
@@ -59,9 +70,8 @@ export function blockReason(findings) {
   return "";
 }
 
-// The address that holds the USDC.noble pile the gas hop and the burn spend.
-// Penumbra slices share it. A Noble balance stays on its own key, and the
-// slices join that key. Osmosis joins whichever of those two already exists.
+// The address that holds USDC.noble already outside Penumbra. A Penumbra slice
+// does not join it. Osmosis joins the connected Noble account.
 export function pileRole(findings) {
   if (findings.noble) return "noble";
   if (findings.penumbra) return "exitNoble";
@@ -75,22 +85,20 @@ function gasStep() {
 export function planFor(findings) {
   const blocked = blockReason(findings);
   if (blocked) throw new Error(blocked);
-  const pays = findings.penumbra || findings.noble || findings.osmosis;
+  const outside = findings.noble || findings.osmosis;
+  const pays = findings.penumbra || outside;
   const once = [];
-  if (pays && findings.injGasShort) once.push(gasStep());
+  if (outside && findings.injGasShort) once.push(gasStep());
   if (findings.osmosis) {
     once.push({ id: "gather-osmosis", once: true, hop: "In", title: "Return Osmosis USDC to Noble" });
   }
-  if (findings.penumbra && findings.noble) {
-    once.push({ id: "gather-exit", once: true, hop: "In", title: "Join the Penumbra receipts" });
-  }
-  if (pays) {
+  if (outside) {
     once.push(
       { id: "cctp-noble", once: true, hop: "In", title: "Burn USDC.noble" },
       { id: "cctp-forward", once: true, hop: "In", title: "Issue USDC.inj" },
     );
   }
-  if (pays || findings.usdcInj) {
+  if (outside || findings.usdcInj) {
     once.push({ id: "deposit", once: true, hop: "In", title: "Enter Penumbra" });
   }
   if (pays) {
@@ -111,7 +119,7 @@ export function keysForStep(stepId, findings = {}) {
   const pile = pileRole(findings);
   if (stepId === "cctp-noble") return pile === "noble" ? ["noble", "avalanche"] : ["avalanche"];
   if (stepId === "cctp-forward") return ["injLeave"];
-  if (stepId === "leave") return ["exitNoble"];
+  if (stepId === "leave") return [];
   if (stepId === "gather-osmosis" || stepId === "gather-exit") return pile === "noble" ? ["noble"] : [];
   return [];
 }
@@ -143,22 +151,28 @@ function named(ctx, role, fallback) {
 export function describeStep(stepId, ctx) {
   const a = ctx.addresses;
   const findings = ctx.findings;
-  const pays = findings.penumbra || findings.noble || findings.osmosis;
-  const moved = pays
-    ? migrateAmount(findings, ctx.amountOut, ctx.amountIn, ctx.amountOsmosis)
-    : ctx.amountIn;
+  const outside = outsideAmount(findings, ctx.amountIn, ctx.amountOsmosis);
   const holder = named(ctx, pileRole(findings), "");
   if (stepId === "leave") {
     return {
-      detail: "This slice leaves Penumbra.",
+      detail: "This slice buys INJ for a new Injective account and burns the rest to that account.",
       messages: [
         {
           type: "penumbra-withdraw",
           value: {
             asset: "USDC",
-            to: "USDC.noble",
-            amount: ctx.amountBase,
-            receiver: addr(a.exitNoble),
+            to: "INJ",
+            amount: "the quoted input",
+            receiver: "a new Injective account",
+          },
+        },
+        {
+          type: "penumbra-withdraw",
+          value: {
+            asset: "USDC",
+            to: "USDC.inj",
+            amount: "the remainder",
+            receiver: "a new Injective account",
           },
         },
       ],
@@ -175,7 +189,7 @@ export function describeStep(stepId, ctx) {
             toChainId: AVALANCHE_CHAIN,
             burn_token: USDC_NOBLE_DENOM,
             asset: "USDC.noble",
-            amount: moved,
+            amount: outside,
             signer: addr(holder),
             mint_recipient: addr(a.avalanche),
           },
@@ -212,7 +226,7 @@ export function describeStep(stepId, ctx) {
             chainId: RELEASE_CHAIN,
             denom: RELEASE_DENOM,
             asset: "USDC.inj",
-            amount: moved,
+            amount: outside,
             released: true,
             recipient: addr(a.injEthereum),
           },
@@ -275,14 +289,15 @@ export function describeStep(stepId, ctx) {
   if (stepId === "deposit") {
     const messages = [];
     const receiver = a?.zafu || ZAFU_RECEIVER;
-    if (pays) {
-      messages.push(ibcTransfer(addr(a.injLeave), INJ_USDC_DENOM, moved, receiver, INJECTIVE_TO_PENUMBRA));
+    const also = findings.penumbra || findings.noble || findings.osmosis;
+    if (findings.noble || findings.osmosis) {
+      messages.push(ibcTransfer(addr(a.injLeave), INJ_USDC_DENOM, outside, receiver, INJECTIVE_TO_PENUMBRA));
     }
     if (findings.usdcInj) {
       messages.push(ibcTransfer(
         named(ctx, "userInj", USER_INJ),
         INJ_USDC_DENOM,
-        pays ? (ctx.amountHeld ?? "already held, unread in this cut") : ctx.amountIn,
+        also ? (ctx.amountHeld ?? "already held, unread in this cut") : ctx.amountIn,
         receiver,
         INJECTIVE_TO_PENUMBRA,
       ));

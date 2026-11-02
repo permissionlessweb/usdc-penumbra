@@ -22,11 +22,11 @@
         <div class="connects">
           <div class="connect">
             <button class="ghost" id="zafu" type="button">Connect Zafu</button>
-            <p id="zafu-status">Not connected.</p>
+            <p id="zafu-status" hidden></p>
           </div>
           <div class="connect">
             <button class="ghost" id="keplr" type="button">Connect Keplr</button>
-            <p id="keplr-status">Not connected.</p>
+            <p id="keplr-status" hidden></p>
           </div>
         </div>
       </section>
@@ -45,6 +45,9 @@
           <button class="ghost" id="read" type="button">Read</button>
           <button class="ghost" id="begin" type="button" disabled>Begin</button>
           <button class="ghost" id="restart" type="button">Restart</button>
+        </div>
+        <div class="actions" id="dev-actions" hidden>
+          <button class="ghost" id="dev-return" type="button" disabled>Return Osmosis USDC to Penumbra</button>
         </div>
         <p id="begin-status"></p>
         <ol id="plan"></ol>
@@ -75,6 +78,7 @@
       <p>Max uses the full balance.</p>
       <p>Send the funds to a diversified address of the Zafu account.</p>
       <p>The deposit asks Zafu until that Penumbra balance increases.</p>
+      <p>A Penumbra slice signs the fee withdrawal, then signs the migration. The first buys the fee for a new Injective account. The second burns the rest to that account. That account deposits to the same Zafu address.</p>
       <p>Privacy starts in Penumbra.</p>
       <p>When the Injective wallet cannot pay the fee, buy that INJ on Osmosis first.</p>
       <p>Bridge that INJ to the Injective wallet.</p>
