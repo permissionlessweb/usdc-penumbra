@@ -30,21 +30,81 @@ function ethereumAddress(injBech32) {
   return ethhex.encode(bech32.fromWords(decoded.words));
 }
 
+const STORE = "usdc-penumbra.hops";
 const keys = new Map();
+const accounts = new Map();
+
+function browserStorage() {
+  try {
+    if (typeof localStorage === "undefined") return null;
+    localStorage.setItem(STORE, localStorage.getItem(STORE) || "[]");
+    return localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readStore() {
+  const store = browserStorage();
+  if (!store) return [];
+  try {
+    const parsed = JSON.parse(store.getItem(STORE) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeStore(rows) {
+  const store = browserStorage();
+  if (!store) return;
+  if (!rows.length) store.removeItem(STORE);
+  else store.setItem(STORE, JSON.stringify(rows));
+}
+
+function openAccount(row) {
+  const spec = CHAINS[row.chain];
+  const { publicKey, privateKey } = resolveKeyPair(row.mnemonic, { coinType: spec.coinType });
+  const encoded = resolveBech32Address(publicKey, spec.prefix, spec.keyType);
+  const ethereum = spec.keyType === "ethsecp256k1" ? ethereumAddress(encoded) : null;
+  const address = row.chain === "avalanche" ? ethereum : encoded;
+  keys.set(row.keyId, privateKey);
+  const account = { keyId: row.keyId, address, ethereum, chain: row.chain };
+  accounts.set(row.keyId, account);
+  return account;
+}
+
+function remember(row) {
+  const rows = readStore().filter((item) => item.keyId !== row.keyId);
+  rows.push({ keyId: row.keyId, chain: row.chain, mnemonic: row.mnemonic });
+  writeStore(rows);
+}
+
+export function restoreHeld() {
+  for (const row of readStore()) {
+    if (!row?.mnemonic || !row.keyId || !CHAINS[row.chain] || keys.has(row.keyId)) continue;
+    try {
+      openAccount(row);
+    } catch {
+      // A damaged record stays stored and cannot sign.
+    }
+  }
+}
+
+restoreHeld();
+
+export function heldAccounts() {
+  return [...accounts.values()];
+}
 
 export function issue(chain) {
   const spec = CHAINS[chain];
   if (!spec) throw new Error(`unsupported chain ${chain}`);
   const mnemonic = generateMnemonic(wordlist, 128);
-  const { publicKey, privateKey } = resolveKeyPair(mnemonic, {
-    coinType: spec.coinType,
-  });
-  const encoded = resolveBech32Address(publicKey, spec.prefix, spec.keyType);
-  const ethereum = spec.keyType === "ethsecp256k1" ? ethereumAddress(encoded) : null;
-  const address = chain === "avalanche" ? ethereum : encoded;
   const keyId = crypto.randomUUID();
-  keys.set(keyId, privateKey);
-  return { keyId, address, ethereum, chain };
+  const account = openAccount({ keyId, chain, mnemonic });
+  remember({ keyId, chain, mnemonic });
+  return account;
 }
 
 export function publicKeyOf(keyId) {
@@ -70,6 +130,8 @@ export function wipe(keyId) {
   const key = keys.get(keyId);
   if (key) key.fill(0);
   keys.delete(keyId);
+  accounts.delete(keyId);
+  writeStore(readStore().filter((item) => item.keyId !== keyId));
 }
 
 export function heldCount() {

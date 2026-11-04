@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ORBITER } from "./circle.js";
-import { INJ_ON_OSMOSIS, INJ_USDC_DENOM, OSMOSIS_USDC_DENOM, RELEASE_DENOM } from "./route.js";
+import { ORBITER, bytesToBase64, ethereumBytes32, orbiterMemo } from "./circle.js";
+import { RELAY_GAS } from "./evm.js";
+import { INJ_ON_OSMOSIS, INJ_USDC_DENOM, OSMOSIS_USDC_DENOM, WAVAX_ON_OSMOSIS } from "./route.js";
 import { GAS, fee } from "./tx.js";
 import { performStep, returnOsmosisToPenumbra, routesFromExactOut, walkMigration } from "./walk.js";
 
 const INJ_FEE = fee("injective-1", GAS.deposit).amount;
 
-const mint = "AAAAAAAAAAAAAAAAga8VDSpX1SZ/mDgerSSO7C9jhW8=";
-const caller = "AAAAAAAAAAAAAAAA+XAYmOelQwKNR6ORO8GRyuc3EzQ=";
 
 function readVarint(bytes, offset) {
   let value = 0n;
@@ -83,7 +82,12 @@ function key(address, denom) {
 }
 
 function response(body, ok = true, status = 200) {
-  return { ok, status, json: async () => body };
+  return {
+    ok,
+    status,
+    json: async () => body,
+    text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
+  };
 }
 
 function harness(seed, options = {}) {
@@ -91,6 +95,7 @@ function harness(seed, options = {}) {
   const sends = [];
   const bodies = [];
   const sleeps = [];
+  const urls = [];
   let now = 1_000_000;
   let penumbra = options.penumbra ?? "0";
   let nobleHeld = options.noble ?? "0";
@@ -108,8 +113,25 @@ function harness(seed, options = {}) {
     txTimeoutMs: 5000,
     fetch: async (url, init) => {
       const text = String(url);
+      urls.push(text);
+      if (
+        text.includes("api.skip.build")
+        || text.includes("/v2/fungible/")
+        || text.includes("/v2/tx/track")
+      ) {
+        throw new Error(`Skip is not used. ${text}`);
+      }
       if (text.includes("/cosmos/auth/v1beta1/accounts/")) {
         return response({ account: { account_number: "1", sequence: "0" } });
+      }
+      if (init?.method === "POST" && text.includes("/cosmos/tx/v1beta1/txs")) {
+        const chainId = text.includes("osmosis") ? "osmosis-1"
+          : text.includes("noble") ? "noble-1"
+          : text.includes("injective") ? "injective-1"
+          : "";
+        sends.push(chainId);
+        io.onSend?.(chainId, balances, sends.length);
+        return response({ tx_response: { code: 0, txhash: "AB".repeat(32), raw_log: "" } });
       }
       if (text.includes("/cosmos/tx/v1beta1/txs/")) {
         return response(options.txResult || { tx_response: { code: 0, height: "8", raw_log: "" } });
@@ -120,23 +142,19 @@ function harness(seed, options = {}) {
         const denom = parsed.searchParams.get("denom");
         return response({ balance: { denom, amount: balances.get(key(address, denom)) || "0" } });
       }
-      if (text.endsWith("/v2/fungible/route")) {
-        const request = JSON.parse(init.body);
-        const built = request.source_asset_chain_id === "osmosis-1"
-          ? osmosisCircleRoute(request)
-          : circleRoute(request);
-        if (options.swap) return response({ ...built, does_swap: true });
-        return response(built);
-      }
-      if (text.endsWith("/v2/fungible/msgs")) {
-        const request = JSON.parse(init.body);
-        if (request.source_asset_chain_id === "osmosis-1") {
-          return response(osmosisMsgs(request.address_list[0], request.amount_in, options.transfer));
-        }
-        return response(circleMsgs(request.address_list[0]));
-      }
-      if (text.endsWith("/v2/tx/track")) throw new Error("track down");
       if (text.includes("/router/quote")) return response(options.quote || exactOut("80", "10"));
+      if (text.includes("api.avax.network")) {
+        let method = "";
+        try { method = JSON.parse(init?.body || "{}").method || ""; } catch { method = ""; }
+        const result = method === "eth_gasPrice" ? "0x2"
+          : method === "eth_getBalance" ? (options.avaxBalance || "0x0")
+          : method === "eth_estimateGas" ? "0x10"
+          : method === "eth_getTransactionCount" ? "0x0"
+          : method === "eth_sendRawTransaction" ? `0x${"cd".repeat(32)}`
+          : "0x1";
+        return response({ jsonrpc: "2.0", id: 1, result });
+      }
+      if (text.includes("api.axelarscan.io")) return response("5");
       return response({}, false, 404);
     },
     keplr: {
@@ -157,6 +175,7 @@ function harness(seed, options = {}) {
         return new Uint8Array(32).fill(9);
       },
     },
+    onSend: options.onSend,
     wipeNoted() {
       wiped += 1;
       return options.wipedKeys || 0;
@@ -173,6 +192,7 @@ function harness(seed, options = {}) {
     sends,
     bodies,
     sleeps,
+    urls,
     balances,
     wiped: () => wiped,
     setPenumbra(amount) { penumbra = amount; },
@@ -181,112 +201,18 @@ function harness(seed, options = {}) {
   };
 }
 
-function circleRoute(request) {
-  return {
-    does_swap: false,
-    swap_venues: [],
-    txs_required: 1,
-    amount_in: request.amount_in,
-    amount_out: request.amount_in,
-    source_asset_denom: "uusdc",
-    source_asset_chain_id: "noble-1",
-    dest_asset_denom: INJ_USDC_DENOM,
-    dest_asset_chain_id: "injective-1",
-    operations: [
-      { cctp_transfer: { from_chain_id: "noble-1", burn_token: "uusdc" } },
-      { cctp_transfer_v2: { to_chain_id: "1776", denom_out: RELEASE_DENOM } },
-    ],
-  };
-}
-
-function osmosisCircleRoute(request) {
-  return {
-    does_swap: false,
-    swap_venues: [],
-    txs_required: 1,
-    amount_in: request.amount_in,
-    amount_out: request.amount_in,
-    source_asset_denom: OSMOSIS_USDC_DENOM,
-    source_asset_chain_id: "osmosis-1",
-    dest_asset_denom: INJ_USDC_DENOM,
-    dest_asset_chain_id: "injective-1",
-    operations: [
-      {
-        transfer: {
-          from_chain_id: "osmosis-1",
-          to_chain_id: "noble-1",
-          channel: "channel-750",
-          denom_in: OSMOSIS_USDC_DENOM,
-          denom_out: "uusdc",
-        },
-      },
-      { cctp_transfer: { from_chain_id: "noble-1", burn_token: "uusdc" } },
-      { cctp_transfer_v2: { to_chain_id: "1776", denom_out: RELEASE_DENOM } },
-    ],
-  };
-}
-
-function osmosisMsgs(sender, amount, overrides = {}) {
-  const memo = JSON.stringify({
-    orbiter: {
-      forwarding: {
-        protocol_id: "PROTOCOL_CCTP",
-        attributes: { destination_domain: overrides.domain ?? 1 },
-      },
-    },
-  });
-  return {
-    txs: [{
-      cosmos_tx: {
-        chain_id: "osmosis-1",
-        signer_address: sender,
-        msgs: [{
-          msg_type_url: "/ibc.applications.transfer.v1.MsgTransfer",
-          msg: JSON.stringify({
-            source_port: "transfer",
-            source_channel: "channel-750",
-            token: { denom: OSMOSIS_USDC_DENOM, amount },
-            sender,
-            receiver: overrides.receiver || ORBITER,
-            timeout_timestamp: "5",
-            memo: overrides.memo === undefined ? memo : overrides.memo,
-          }),
-        }],
-      },
-    }],
-  };
-}
-
-function circleMsgs(signer) {
-  return {
-    txs: [{
-      cosmos_tx: {
-        chain_id: "noble-1",
-        signer_address: signer,
-        msgs: [
-          {
-            msg_type_url: "/circle.cctp.v1.MsgDepositForBurnWithCaller",
-            msg: JSON.stringify({
-              from: signer,
-              amount: "980000",
-              destination_domain: 1,
-              mint_recipient: mint,
-              burn_token: "uusdc",
-              destination_caller: caller,
-            }),
-          },
-          {
-            msg_type_url: "/cosmos.bank.v1beta1.MsgSend",
-            msg: JSON.stringify({
-              from_address: signer,
-              to_address: "noble1dyw0geqa2cy0ppdjcxfpzusjpwmq85r5a35hqe",
-              amount: [{ denom: "uusdc", amount: "20000" }],
-            }),
-          },
-        ],
-      },
-    }],
-  };
+function assertClientBurn(text, mintRecipient) {
+  assert.equal(text.includes(ORBITER), true);
+  assert.equal(text.includes("PROTOCOL_CCTP"), true);
+  assert.equal(text.includes('"destination_domain":1'), true);
+  assert.equal(text.includes("destination_caller"), false);
+  assert.equal(text.includes(bytesToBase64(ethereumBytes32(mintRecipient))), true);
+  assert.equal(text.includes("pre_actions"), false);
+  assert.equal(text.includes("ACTION_FEE"), false);
+  assert.equal(text.includes("api.skip.build"), false);
+  assert.equal(text.includes("1776"), false);
+  assert.equal(text.includes("fc05ad74"), false);
+  assert.equal(text.includes("noble1dyw0geqa2cy0ppdjcxfpzusjpwmq85r5a35hqe"), false);
 }
 
 function exactOut(amountIn, amountOut, denom = INJ_ON_OSMOSIS) {
@@ -308,6 +234,27 @@ const accounts = {
   injEthereum: "0x1111111111111111111111111111111111111111",
   zafu: "penumbravault",
 };
+
+function armHeldGas(box) {
+  const hop = "inj1hop";
+  const avaxOut = (2n * RELAY_GAS * 5n + 5n).toString();
+  box.balances.set(key("osmo1user", INJ_ON_OSMOSIS), INJ_FEE);
+  box.balances.set(key("osmo1user", WAVAX_ON_OSMOSIS), avaxOut);
+  box.io.issueHop = async () => ({
+    keyId: "hop",
+    address: hop,
+    ethereum: "0x2222222222222222222222222222222222222222",
+  });
+  box.io.wipeKey = () => {};
+  const previous = box.io.onSend;
+  box.io.onSend = (chain, balances, count) => {
+    if (chain === "osmosis-1" && !balances.get(key(hop, "inj"))) {
+      balances.set(key(hop, "inj"), INJ_FEE);
+    }
+    previous?.(chain, balances, count);
+  };
+  return hop;
+}
 
 function osmosisInput(extra = {}) {
   return {
@@ -393,27 +340,66 @@ describe("walk", () => {
     assert.deepEqual(box.sends, ["osmosis-1"]);
     const signed = new TextDecoder().decode(box.bodies[0]);
     assert.equal(signed.includes("channel-750"), true);
-    assert.equal(signed.includes(ORBITER), true);
-    assert.equal(signed.includes("PROTOCOL_CCTP"), true);
+    assertClientBurn(signed, accounts.avalanche);
+    assert.equal(box.urls.some((url) => url.includes("api.skip.build")), false);
     const burn = await performStep({ id: "cctp-noble" }, null, ctx, box.io);
     assert.equal(burn, "The Noble burn is in the Osmosis transfer.");
     assert.deepEqual(box.sends, ["osmosis-1"]);
   });
 
-  it("does not sign a transfer that leaves the USDC on Noble", async () => {
+  it("sends the live USDC balance when the tracked amount is higher", async () => {
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "933429",
+    });
+    await performStep({ id: "gather-osmosis" }, null, {
+      findings: { osmosis: true },
+      amountOsmosis: "933608",
+      addresses: accounts,
+    }, box.io);
+    const signed = new TextDecoder().decode(box.bodies[0]);
+    assert.equal(signed.includes("923429"), true);
+    assert.equal(signed.includes("933608"), false);
+  });
+
+  it("keeps the USDC.noble fee out of the Noble return", async () => {
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "1",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "933608",
+    });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      if (String(url).includes("spot_price_by_denom")) {
+        return response({ poolID: "1464", spot_price: "21.002132398102827266" });
+      }
+      return fetchImpl(url, init);
+    };
+    await performStep({ id: "gather-osmosis" }, null, {
+      findings: { osmosis: true },
+      amountOsmosis: "933608",
+      addresses: accounts,
+    }, box.io);
+    const signed = new TextDecoder().decode(box.bodies[0]);
+    assert.equal(signed.includes("923608"), true);
+    assert.equal(signed.includes("933608"), false);
+  });
+
+  it("refuses a transfer whose mint recipient is not an Ethereum address", async () => {
     const box = harness({
       [key("osmo1user", "uosmo")]: "100000",
       [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
-    }, { transfer: { receiver: "noble1user" } });
+    });
     await assert.rejects(
       () => performStep({ id: "gather-osmosis" }, null, {
         findings: { osmosis: true, noble: false, penumbra: false, usdcInj: false, injGasShort: false },
         amountOsmosis: "1000000",
-        addresses: accounts,
+        addresses: { ...accounts, avalanche: "", injEthereum: "" },
       }, box.io),
-      /does not burn on arrival/,
+      /required account is not connected/,
     );
     assert.deepEqual(box.sends, []);
+    assert.throws(() => orbiterMemo("noble1user"), /mint recipient/);
+    assert.throws(() => orbiterMemo(""), /mint recipient/);
   });
 
   it("does not sign the burn when Injective does not receive the USDC", async () => {
@@ -421,6 +407,7 @@ describe("walk", () => {
       [key("osmo1user", "uosmo")]: "100000",
       [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
     });
+    armHeldGas(box);
     let wipedRun = null;
     box.io.wipeNoted = (run) => {
       wipedRun = run;
@@ -441,15 +428,277 @@ describe("walk", () => {
     });
     assert.equal(result.status, "halted");
     assert.match(result.halt.reason, /The Injective balance did not increase/);
-    assert.deepEqual(box.sends, ["osmosis-1"]);
+    assert.equal(box.urls.some((url) => url.includes("iris-api.circle.com")), false);
+    assert.equal(views.some((view) => view.rows.some((row) => /Waiting for the Noble burn/.test(row.detail || ""))), true);
+    assert.equal(views.some((view) => view.rows.some((row) => /has not attested/.test(row.detail || ""))), false);
+    assert.deepEqual(box.sends, ["osmosis-1", "osmosis-1"]);
     assert.equal(wipedRun.halt, null);
-    assert.equal(views.at(-1).rows[0].state, "acked");
-    assert.equal(views.at(-1).rows[1].state, "acked");
-    assert.equal(views.at(-1).rows[2].state, "failed");
+    assert.equal(views.at(-1).rows.find((row) => row.id === "cctp-forward").state, "failed");
     assert.equal(views[0].rows[0].state, "running");
   });
 
-  it("buys the shortfall on Osmosis and bridges only the INJ the swap gained", async () => {
+  it("asks Circle about the Noble receive, not the Osmosis send", async () => {
+    const osmosisHash = "aa".repeat(32);
+    const nobleHash = "bb".repeat(32);
+    const box = harness({ [key("inj1user", INJ_USDC_DENOM)]: "0" });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes("/cosmos/tx/v1beta1/txs?")) {
+        box.urls.push(text);
+        return response({ tx_responses: [{ txhash: nobleHash }] });
+      }
+      if (text.includes("iris-api.circle.com")) {
+        box.urls.push(text);
+        box.balances.set(key("inj1user", INJ_USDC_DENOM), "1000000");
+        return response({ status: "complete", attestation: "0x01" });
+      }
+      if (text.endsWith(`/txs/${nobleHash}`)) {
+        box.urls.push(text);
+        return response({
+          tx_response: {
+            events: [{
+              type: "circle.cctp.v1.MessageSent",
+              attributes: [{ key: "message", value: JSON.stringify(btoa("\u00ab\u00cd")) }],
+            }],
+          },
+        });
+      }
+      if (text.includes("/cosmos/tx/v1beta1/txs/")) {
+        box.urls.push(text);
+        return response({
+          tx_response: {
+            code: 0,
+            events: [{
+              type: "send_packet",
+              attributes: [
+                { key: "packet_src_channel", value: "channel-750" },
+                { key: "packet_sequence", value: "9" },
+              ],
+            }],
+          },
+        });
+      }
+      return fetchImpl(url, init);
+    };
+    const detail = await performStep({ id: "cctp-forward" }, null, {
+      findings: { osmosis: true },
+      bridgedBurn: true,
+      burnHash: osmosisHash,
+      usdcInjBefore: "0",
+      addresses: accounts,
+    }, box.io);
+    assert.equal(detail, "USDC.inj arrived.");
+    assert.equal(box.urls.some((url) => url.includes("/v1/attestations/")), true);
+    assert.equal(box.urls.some((url) => url.includes("iris-api.circle.com") && url.includes(osmosisHash)), false);
+  });
+
+  it("stops when Noble acknowledges the packet with an error", async () => {
+    const osmosisHash = "aa".repeat(32);
+    const nobleHash = "bb".repeat(32);
+    const box = harness({ [key("inj1user", INJ_USDC_DENOM)]: "0" });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes("/cosmos/tx/v1beta1/txs?")) {
+        return response({ tx_responses: [{ txhash: nobleHash }] });
+      }
+      if (text.endsWith(`/txs/${osmosisHash}`)) {
+        return response({
+          tx_response: {
+            events: [{
+              type: "send_packet",
+              attributes: [
+                { key: "packet_src_channel", value: "channel-750" },
+                { key: "packet_sequence", value: "4" },
+              ],
+            }],
+          },
+        });
+      }
+      if (text.endsWith(`/txs/${nobleHash}`)) {
+        return response({
+          tx_response: {
+            events: [{
+              type: "write_acknowledgement",
+              attributes: [{ key: "packet_ack", value: JSON.stringify({ error: "malformed destination caller" }) }],
+            }],
+          },
+        });
+      }
+      return fetchImpl(url, init);
+    };
+    await assert.rejects(
+      () => performStep({ id: "cctp-forward" }, null, {
+        bridgedBurn: true,
+        burnHash: osmosisHash,
+        usdcInjBefore: "0",
+        addresses: accounts,
+      }, box.io),
+      /Noble did not burn the USDC\. malformed destination caller/,
+    );
+  });
+
+  it("preflights and submits the Avalanche mint", async () => {
+    const hash = "cc".repeat(32);
+    const box = harness({
+      [key("inj1hop", INJ_USDC_DENOM)]: "0",
+    }, { avaxBalance: "0x1000000000000000000" });
+    let raw = 0;
+    const progress = [];
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes(`/txs/${hash}`)) {
+        box.urls.push(text);
+        return response({
+          tx_response: {
+            events: [{
+              type: "circle.cctp.v1.MessageSent",
+              attributes: [{ key: "message", value: JSON.stringify(btoa("\u00ab\u00cd")) }],
+            }],
+          },
+        });
+      }
+      if (text.includes("iris-api.circle.com")) {
+        box.urls.push(text);
+        return response({ status: "complete", attestation: "0x01" });
+      }
+      const payload = init?.body ? JSON.parse(init.body) : null;
+      const result = await fetchImpl(url, init);
+      if (payload?.method === "eth_sendRawTransaction") {
+        raw += 1;
+        if (raw === 2) box.balances.set(key("inj1hop", INJ_USDC_DENOM), "1000000");
+      }
+      return result;
+    };
+    box.io.signDigest = async () => new Uint8Array(65);
+    box.io.onProgress = (line) => progress.push(line);
+    const detail = await performStep({ id: "cctp-forward" }, null, {
+      findings: { osmosis: true },
+      bridgedBurn: false,
+      burnHash: hash,
+      usdcInjBefore: "0",
+      depositHop: {
+        keyId: "hop",
+        address: "inj1hop",
+        ethereum: "0x2222222222222222222222222222222222222222",
+      },
+      addresses: accounts,
+    }, box.io);
+    assert.equal(detail, "USDC.inj arrived.");
+    assert.equal(raw, 2);
+    assert.equal(progress.some((line) => line.startsWith("Submitted the Avalanche mint.")), true);
+    assert.equal(progress.some((line) => line.startsWith("Submitted the burn toward Injective.")), true);
+    assert.equal(progress.some((line) => /has not attested/.test(line)), false);
+    assert.equal(box.urls.some((url) => url.includes("api.avax.network")), true);
+    assert.equal(box.urls.some((url) => url.includes("/v1/attestations/")), true);
+  });
+
+  it("does not ask the browser wallet before the ephemeral account has AVAX", async () => {
+    const hash = "dd".repeat(32);
+    const box = harness({ [key("inj1hop", INJ_USDC_DENOM)]: "0" });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes(`/txs/${hash}`)) {
+        return response({
+          tx_response: {
+            events: [{
+              type: "circle.cctp.v1.MessageSent",
+              attributes: [{ key: "message", value: "0xabcd" }],
+            }],
+          },
+        });
+      }
+      if (text.includes("iris-api.circle.com")) {
+        return response({ status: "complete", attestation: "0x01" });
+      }
+      return fetchImpl(url, init);
+    };
+    box.io.signDigest = async () => { throw new Error("The hop signed too early."); };
+    box.io.ethereum = { request() { throw new Error("MetaMask was asked."); } };
+    box.io.cctpTimeoutMs = 0;
+    const progress = [];
+    box.io.onProgress = (line) => progress.push(line);
+    await assert.rejects(
+      () => performStep({ id: "cctp-forward" }, null, {
+        bridgedBurn: false,
+        burnHash: hash,
+        usdcInjBefore: "0",
+        depositHop: {
+          keyId: "hop",
+          address: "inj1hop",
+          ethereum: "0x2222222222222222222222222222222222222222",
+        },
+        addresses: accounts,
+      }, box.io),
+      /The Injective balance did not increase/,
+    );
+    assert.equal(progress.some((line) => line.includes("Waiting for AVAX on the ephemeral account.")), true);
+  });
+
+  it("burns toward Injective when the Avalanche nonce was already used", async () => {
+    const hash = "ee".repeat(32);
+    const box = harness({
+      [key("inj1hop", INJ_USDC_DENOM)]: "0",
+    }, { avaxBalance: "0x1000000000000000000" });
+    let raw = 0;
+    let allowance = 0n;
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes(`/txs/${hash}`)) {
+        return response({
+          tx_response: {
+            events: [{
+              type: "circle.cctp.v1.MessageSent",
+              attributes: [{ key: "message", value: "0xabcd" }],
+            }],
+          },
+        });
+      }
+      if (text.includes("iris-api.circle.com")) {
+        return response({ status: "complete", attestation: "0x01" });
+      }
+      const payload = init?.body ? JSON.parse(init.body) : null;
+      if (payload?.method === "eth_call") {
+        const data = payload.params?.[0]?.data || "";
+        if (data.startsWith("0x70a08231")) return response({ jsonrpc: "2.0", id: 1, result: "0x0f4240" });
+        if (data.startsWith("0xdd62ed3e")) {
+          return response({ jsonrpc: "2.0", id: 1, result: `0x${allowance.toString(16)}` });
+        }
+        return response({ jsonrpc: "2.0", id: 1, error: { message: "execution reverted: Nonce already used" } });
+      }
+      const result = await fetchImpl(url, init);
+      if (payload?.method === "eth_sendRawTransaction") {
+        raw += 1;
+        if (raw === 1) allowance = 1000000n;
+        if (raw === 2) box.balances.set(key("inj1hop", INJ_USDC_DENOM), "1000000");
+      }
+      return result;
+    };
+    box.io.signDigest = async () => new Uint8Array(65);
+    const progress = [];
+    box.io.onProgress = (line) => progress.push(line);
+    const detail = await performStep({ id: "cctp-forward" }, null, {
+      bridgedBurn: false,
+      burnHash: hash,
+      usdcInjBefore: "0",
+      depositHop: {
+        keyId: "hop",
+        address: "inj1hop",
+        ethereum: "0x2222222222222222222222222222222222222222",
+      },
+      addresses: accounts,
+    }, box.io);
+    assert.equal(detail, "USDC.inj arrived.");
+    assert.equal(raw, 2);
+    assert.equal(progress.some((line) => line.includes("The Avalanche mint is already in.")), true);
+    assert.equal(progress.some((line) => line.startsWith("Submitted the burn toward Injective.")), true);
+  });
+
+  it("buys the full fee for a new account and bridges the INJ the swap gained", async () => {
     let osmosisSends = 0;
     const ctx = {
       findings: { osmosis: true, noble: false, penumbra: false, usdcInj: false, injGasShort: true },
@@ -458,6 +707,7 @@ describe("walk", () => {
       amountIn: "0",
       addresses: accounts,
     };
+    const hop = "inj1hop";
     const box = harness({
       [key("osmo1user", "uosmo")]: "100000",
       [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
@@ -467,30 +717,43 @@ describe("walk", () => {
       onSend(chain, balances) {
         if (chain !== "osmosis-1") return;
         osmosisSends += 1;
-        if (osmosisSends === 1) {
-          balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "999600");
-          balances.set(key("osmo1user", INJ_ON_OSMOSIS), "13");
-        }
-        if (osmosisSends === 2) balances.set(key("inj1user", "inj"), INJ_FEE);
+        balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "999600");
+        balances.set(key(hop, "inj"), INJ_FEE);
       },
-      quoteFn: async (shortfall) => {
-        assert.equal(shortfall, (BigInt(INJ_FEE) - 1n).toString());
-        return exactOut("81", shortfall);
+      quoteFn: async (amount, denom) => {
+        if (denom === WAVAX_ON_OSMOSIS) {
+          assert.equal(amount, (2n * RELAY_GAS * 5n + 5n).toString());
+          return exactOut("40", amount, denom);
+        }
+        assert.equal(amount, INJ_FEE);
+        return exactOut("81", amount);
       },
     });
+    box.io.issueHop = async () => ({
+      keyId: "hop",
+      address: hop,
+      ethereum: "0x2222222222222222222222222222222222222222",
+    });
+    box.io.wipeKey = () => {};
     const detail = await performStep({ id: "gas-osmosis" }, null, ctx, box.io);
     assert.match(detail, /INJ arrived/);
-    assert.deepEqual(box.sends, ["osmosis-1", "osmosis-1"]);
+    assert.match(detail, /Axelar relays the AVAX/);
+    assert.deepEqual(box.sends, ["osmosis-1"]);
     assert.equal(ctx.amountOsmosis, "999600");
-    const swap = new TextDecoder().decode(box.bodies[0]);
-    const bridged = new TextDecoder().decode(box.bodies[1]);
-    assert.equal(swap.includes("/osmosis.poolmanager.v1beta1.MsgSwapExactAmountOut"), true);
-    assert.equal(swap.includes(OSMOSIS_USDC_DENOM), true);
-    assert.equal(swap.includes("81"), true);
-    assert.equal(swap.includes(INJ_ON_OSMOSIS), true);
-    assert.equal(bridged.includes("channel-122"), true);
-    assert.equal(bridged.includes("10"), true);
-    assert.equal(bridged.includes("13"), false);
+    assert.equal(ctx.depositHop.address, hop);
+    const body = new TextDecoder().decode(box.bodies[0]);
+    assert.equal(body.includes("/osmosis.poolmanager.v1beta1.MsgSwapExactAmountOut"), true);
+    assert.equal(body.includes(OSMOSIS_USDC_DENOM), true);
+    assert.equal(body.includes("81"), true);
+    assert.equal(body.includes(INJ_ON_OSMOSIS), true);
+    assert.equal(body.includes("channel-122"), true);
+    assert.equal(body.includes(hop), true);
+    assert.equal(body.includes("inj1user"), false);
+    assert.equal(body.includes(INJ_FEE), true);
+    assert.equal(body.includes("channel-208"), true);
+    assert.equal(body.includes("avalanche"), true);
+    assert.equal(body.includes(WAVAX_ON_OSMOSIS), true);
+    assert.equal(body.includes("2222222222222222222222222222222222222222"), false);
   });
 
   it("moves only the quoted USDC from Noble when Osmosis cannot cover it", async () => {
@@ -510,29 +773,37 @@ describe("walk", () => {
       [key("inj1user", "inj")]: "0",
     }, {
       onSend(chain, balances) {
-        if (chain === "noble-1") balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "90");
+        if (chain === "noble-1") balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "130");
         if (chain === "osmosis-1") {
           osmosisSends += 1;
-          if (osmosisSends === 1) {
-            balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "20");
-            balances.set(key("osmo1user", INJ_ON_OSMOSIS), "13");
-          }
-          if (osmosisSends === 2) balances.set(key("inj1user", "inj"), INJ_FEE);
+          balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "20");
+          balances.set(key("inj1hop", "inj"), INJ_FEE);
         }
       },
-      quoteFn: async (shortfall) => exactOut("80", shortfall),
+      quoteFn: async (amount, denom) => {
+        if (denom === WAVAX_ON_OSMOSIS) return exactOut("40", amount, denom);
+        return exactOut("80", amount);
+      },
     });
+    const hop = "inj1hop";
+    box.io.issueHop = async () => ({
+      keyId: "hop",
+      address: hop,
+      ethereum: "0x2222222222222222222222222222222222222222",
+    });
+    box.io.wipeKey = () => {};
     const detail = await performStep({ id: "gas-osmosis" }, null, ctx, box.io);
     assert.match(detail, /INJ arrived/);
-    assert.deepEqual(box.sends, ["noble-1", "osmosis-1", "osmosis-1"]);
-    assert.equal(ctx.amountIn, "999920");
+    assert.deepEqual(box.sends, ["noble-1", "osmosis-1"]);
+    assert.equal(ctx.amountIn, "999880");
     assert.equal(ctx.amountOsmosis, "20");
     const moved = new TextDecoder().decode(box.bodies[0]);
-    const bridged = new TextDecoder().decode(box.bodies[2]);
+    const bridged = new TextDecoder().decode(box.bodies[1]);
     assert.equal(moved.includes("channel-1"), true);
-    assert.equal(moved.includes("80"), true);
-    assert.equal(bridged.includes("10"), true);
-    assert.equal(bridged.includes("13"), false);
+    assert.equal(moved.includes("120"), true);
+    assert.equal(bridged.includes(hop), true);
+    assert.equal(bridged.includes("channel-122"), true);
+    assert.equal(bridged.includes("channel-208"), true);
   });
 
   it("does not spend unselected Osmosis USDC on the fee", async () => {
@@ -584,17 +855,39 @@ describe("walk", () => {
     assert.equal(quoteUrl.includes("singleRoute=true"), true);
   });
 
-  it("skips the fee swap when the Injective wallet can already pay", async () => {
+  it("bridges INJ and AVAX already on Osmosis without swapping", async () => {
+    const hop = "inj1hop";
+    const avaxOut = (2n * RELAY_GAS * 5n + 5n).toString();
     const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
+      [key("osmo1user", INJ_ON_OSMOSIS)]: INJ_FEE,
+      [key("osmo1user", WAVAX_ON_OSMOSIS)]: avaxOut,
       [key("inj1user", "inj")]: INJ_FEE,
+    }, {
+      quoteFn: async () => { throw new Error("quoted"); },
+      onSend(chain, balances) {
+        if (chain === "osmosis-1") balances.set(key(hop, "inj"), INJ_FEE);
+      },
     });
+    box.io.issueHop = async () => ({
+      keyId: "hop",
+      address: hop,
+      ethereum: "0x2222222222222222222222222222222222222222",
+    });
+    box.io.wipeKey = () => {};
     const detail = await performStep({ id: "gas-osmosis" }, null, {
-      findings: { osmosis: true, noble: false, penumbra: false, usdcInj: false, injGasShort: true },
+      findings: { osmosis: true, noble: false, penumbra: false, usdcInj: false, injGasShort: false },
       amountOsmosis: "1000000",
       addresses: accounts,
     }, box.io);
-    assert.equal(detail, "The Injective wallet can pay the fee.");
-    assert.deepEqual(box.sends, []);
+    assert.match(detail, /INJ arrived/);
+    assert.equal(box.sends.length, 1);
+    const body = new TextDecoder().decode(box.bodies[0]);
+    assert.equal(body.includes("MsgSwap"), false);
+    assert.equal(body.includes("channel-122"), true);
+    assert.equal(body.includes(hop), true);
+    assert.equal(body.includes("channel-208"), true);
   });
 
   it("stops before a quote when Osmosis cannot pay the swap", async () => {
@@ -673,11 +966,17 @@ describe("walk", () => {
       [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
       [key("inj1user", "inj")]: "100000000000000",
     }, {
-      onSend(chain, balances) {
-        if (chain === "osmosis-1") balances.set(key("inj1user", INJ_USDC_DENOM), "500000");
+      onSend(chain, balances, count) {
+        if (chain === "osmosis-1" && count === 2) balances.set(key("inj1hop", INJ_USDC_DENOM), "500000");
         if (chain === "injective-1") box.setPenumbra("1");
       },
     });
+    armHeldGas(box);
+    box.io.signHop = async () => {
+      box.sends.push("injective-1");
+      box.setPenumbra("1");
+      return { hash: "ABCD" };
+    };
     const views = [];
     const result = await walkMigration({
       input: osmosisInput(),
@@ -692,28 +991,36 @@ describe("walk", () => {
       onUpdate: (view) => views.push(view.status),
     });
     assert.equal(result.status, "done");
-    assert.deepEqual(box.sends, ["osmosis-1", "injective-1"]);
-    assert.equal(new TextDecoder().decode(box.bodies[0]).includes("PROTOCOL_CCTP"), true);
+    assert.deepEqual(box.sends, ["osmosis-1", "osmosis-1", "injective-1"]);
+    const burnBody = box.bodies.map((body) => new TextDecoder().decode(body)).find((text) => text.includes("PROTOCOL_CCTP"));
+    assertClientBurn(burnBody, "0x2222222222222222222222222222222222222222");
+    assert.equal(box.urls.some((url) => /api\.skip\.build|\/v2\/fungible\/|\/v2\/tx\/track/.test(url)), false);
     assert.equal(box.wiped(), 1);
     assert.equal(views.at(-1), "done");
     assert.equal(result.keys.noble.keyId, null);
   });
 
-  it("refuses a swapping burn and a fee the account cannot pay", async () => {
-    const swapping = harness({
+  it("burns the Noble balance minus the fee and refuses a fee the account cannot pay", async () => {
+    const held = harness({
       [key("noble1user", "uusdc")]: "1000000",
-    }, { swap: true });
-    await assert.rejects(
-      () => performStep({ id: "cctp-noble" }, null, {
-        findings: { noble: true, osmosis: false, penumbra: false, usdcInj: false, injGasShort: false },
-        amountIn: "1000000",
-        amountOut: "0",
-        amountOsmosis: "0",
-        addresses: accounts,
-      }, swapping.io),
-      /route swaps/,
-    );
-    assert.deepEqual(swapping.sends, []);
+    });
+    const burned = await performStep({ id: "cctp-noble" }, null, {
+      findings: { noble: true, osmosis: false, penumbra: false, usdcInj: false, injGasShort: false },
+      amountIn: "1000000",
+      amountOut: "0",
+      amountOsmosis: "0",
+      addresses: accounts,
+    }, held.io);
+    assert.match(burned, /Circle burned/);
+    const burnedBytes = held.bodies[0];
+    const burnedText = new TextDecoder().decode(burnedBytes);
+    assert.equal(burnedText.includes("/circle.cctp.v1.MsgDepositForBurn"), true);
+    assert.equal(burnedText.includes("WithCaller"), false);
+    assert.equal(burnedText.includes("960000"), true);
+    assert.equal(indexOfBytes(burnedBytes, ethereumBytes32(accounts.avalanche)) >= 0, true);
+    assert.equal(burnedText.includes("pre_actions"), false);
+    assert.deepEqual(held.sends, ["noble-1"]);
+    assert.equal(held.urls.some((url) => url.includes("api.skip.build")), false);
 
     const short = harness({ [key("noble1user", "uusdc")]: "40000" });
     await assert.rejects(
@@ -775,6 +1082,44 @@ describe("walk", () => {
     const nine = new Uint8Array([0x12, 0x01, 0x39]);
     assert.equal(signed.includes(five[0]) && indexOfBytes(signed, five) >= 0, true);
     assert.equal(indexOfBytes(signed, nine), -1);
+  });
+
+  it("deposits a held hop after Zafu closes the connection", async () => {
+    let reads = 0;
+    let reconnected = 0;
+    let wiped = "";
+    const box = harness({
+      [key("inj1hop", "inj")]: INJ_FEE,
+      [key("inj1hop", INJ_USDC_DENOM)]: "415240",
+    });
+    box.io.penumbraUsdc = async () => {
+      reads += 1;
+      if (reads === 1) throw new Error("[unavailable] Connection closed");
+      return { noble: "0", inj: box.penumbra(), decimals: 6 };
+    };
+    box.io.reconnectZafu = async () => { reconnected += 1; };
+    let signedAmount = "";
+    box.io.signHop = async (request) => {
+      signedAmount = request.messages[0].value.token.amount;
+      box.setPenumbra("1");
+      return { hash: "ABCD" };
+    };
+    box.io.wipeKey = (id) => { wiped = id; };
+    const detail = await performStep({ id: "deposit" }, null, {
+      finishHeld: true,
+      findings: { penumbra: true },
+      arrivedInj: "0",
+      depositHop: {
+        keyId: "kept",
+        address: "inj1hop",
+        ethereum: "0x2222222222222222222222222222222222222222",
+      },
+      addresses: accounts,
+    }, box.io);
+    assert.match(detail, /Penumbra holds 0\.000001 USDC\.inj/);
+    assert.equal(reconnected, 1);
+    assert.equal(wiped, "kept");
+    assert.equal(signedAmount, "415240");
   });
 
   it("leaves on the channel Zafu names, then waits between slices", async () => {
@@ -865,7 +1210,10 @@ describe("walk", () => {
     );
     assert.deepEqual(dropped, ["early"]);
 
-    const untimed = harness({}, { view, quote: exactOut("100", INJ_FEE) });
+    const leaveQuote = async (amount, denom) => exactOut(denom === WAVAX_ON_OSMOSIS ? "40" : "100", amount, denom);
+    const untimed = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+    }, { view, quoteFn: leaveQuote });
     const wipedHeight = [];
     untimed.io.issueHop = async () => ({
       keyId: "noheight",
@@ -892,7 +1240,9 @@ describe("walk", () => {
         return { plan: { ok: true } };
       },
     };
-    const partial = harness({}, { view: partialView, quote: exactOut("100", INJ_FEE) });
+    const partial = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+    }, { view: partialView, quoteFn: leaveQuote });
     const kept = [];
     partial.io.issueHop = async () => ({
       keyId: "partial",
@@ -929,7 +1279,9 @@ describe("walk", () => {
     assert.equal(partialPlans.length, 2);
     assert.equal(partialPlans[0].ics20Withdrawals.length, 1);
 
-    const box = harness({}, { view, quote: exactOut("100", INJ_FEE) });
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+    }, { view, quoteFn: leaveQuote });
     const issued = [];
     const deposits = [];
     let shielded = 0n;
@@ -988,7 +1340,7 @@ describe("walk", () => {
     const migration = plans[1].ics20Withdrawals[0];
     assert.equal(feeWithdrawal.sourceChannel, "channel-9");
     assert.equal(feeWithdrawal.destinationChainAddress, "pfm");
-    assert.equal(feeWithdrawal.amount.lo, 100n);
+    assert.equal(feeWithdrawal.amount.lo, 140n);
     assert.equal(feeWithdrawal.timeoutTime, 1560000000000n);
     assert.deepEqual(feeWithdrawal.timeoutHeight, {
       revisionNumber: 4n,
@@ -1002,11 +1354,19 @@ describe("walk", () => {
     assert.equal(plans[0].feeMode.value.feeTier, 1);
     const buy = JSON.parse(feeWithdrawal.ics20Memo);
     assert.equal(buy.forward.channel, "channel-1");
-    assert.equal(buy.forward.next.wasm.msg.osmosis_swap.receiver, "inj1hop0");
-    assert.equal(buy.forward.next.wasm.msg.osmosis_swap.slippage.min_output_amount, INJ_FEE);
+    assert.equal(buy.forward.receiver, "osmo1user");
+    assert.equal(buy.forward.next, undefined);
     assert.equal(migration.destinationChainAddress, ORBITER);
-    assert.equal(migration.amount.lo, 900n);
+    assert.equal(migration.amount.lo, 860n);
     assert.match(migration.ics20Memo, /PROTOCOL_CCTP/);
+    const burned = JSON.parse(migration.ics20Memo);
+    assert.equal(burned.orbiter.forwarding.attributes.destination_domain, 1);
+    assert.equal("destination_caller" in burned.orbiter.forwarding.attributes, false);
+    assert.equal(
+      burned.orbiter.forwarding.attributes.mint_recipient,
+      bytesToBase64(ethereumBytes32("0x2222222222222222222222222222222222222222")),
+    );
+    assert.equal("pre_actions" in burned.orbiter, false);
     assert.equal(deposits[0].messages[0].value.token.amount, "900");
     assert.equal(deposits[0].messages[0].value.receiver, "penumbravault");
     assert.equal(deposits[0].messages[0].value.source_channel, "channel-494");
@@ -1044,8 +1404,146 @@ describe("walk", () => {
     assert.equal(box.wiped(), 1);
   });
 
+  it("forwards a Penumbra fee slice, bridges INJ and AVAX, then relays the Noble burn", async () => {
+    const plans = [];
+    const asset = new Uint8Array([9]);
+    const nobleHash = "bb".repeat(32);
+    const hop = {
+      keyId: "slice",
+      address: "inj1slice",
+      ethereum: "0x2222222222222222222222222222222222222222",
+    };
+    const view = {
+      balances: async function* balances() {
+        yield {
+          balanceView: {
+            valueView: {
+              case: "knownAssetId",
+              value: {
+                metadata: {
+                  symbol: "USDC",
+                  base: "transfer/channel-9/uusdc",
+                  penumbraAssetId: { inner: asset },
+                },
+              },
+            },
+          },
+        };
+      },
+      async ephemeralAddress() {
+        return { address: { inner: new Uint8Array([1]) } };
+      },
+      async gasPrices() {
+        return {
+          altGasPrices: [{
+            assetId: { inner: asset },
+            blockSpacePrice: 0n,
+            compactBlockSpacePrice: 0n,
+            verificationPrice: 0n,
+            executionPrice: 0n,
+          }],
+        };
+      },
+      async transactionPlanner(request) {
+        plans.push(request);
+        return { plan: { ok: true } };
+      },
+      async *authorizeAndBuild() {
+        yield { status: { case: "complete", value: { transaction: { raw: true } } } };
+      },
+      async *broadcastTransaction() {
+        box.balances.set(key("osmo1user", OSMOSIS_USDC_DENOM), "1000");
+        yield { status: { case: "broadcastSuccess", value: {} } };
+      },
+    };
+    let raw = 0;
+    const queries = [];
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+    }, {
+      view,
+      avaxBalance: "0x1000000000000000000",
+      quoteFn: async (amount, denom) => exactOut(denom === WAVAX_ON_OSMOSIS ? "40" : "100", amount, denom),
+      onSend(chain, balances) {
+        if (chain === "osmosis-1") balances.set(key(hop.address, "inj"), INJ_FEE);
+      },
+    });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      const text = String(url);
+      if (text.includes("/cosmos/tx/v1beta1/txs?")) {
+        queries.push(text);
+        return response({ tx_responses: [{ txhash: nobleHash }] });
+      }
+      if (text.endsWith(`/txs/${nobleHash}`)) {
+        return response({
+          tx_response: {
+            events: [{
+              type: "circle.cctp.v1.MessageSent",
+              attributes: [{ key: "message", value: JSON.stringify(btoa("\u00ab\u00cd")) }],
+            }],
+          },
+        });
+      }
+      if (text.includes("iris-api.circle.com")) {
+        return response({ status: "complete", attestation: "0x01" });
+      }
+      const payload = init?.body ? JSON.parse(init.body) : null;
+      const result = await fetchImpl(url, init);
+      if (payload?.method === "eth_sendRawTransaction") {
+        raw += 1;
+        if (raw === 2) box.balances.set(key(hop.address, INJ_USDC_DENOM), "860");
+      }
+      return result;
+    };
+    box.io.issueHop = async () => hop;
+    box.io.wipeKey = () => {};
+    box.io.signDigest = async () => new Uint8Array(65);
+    box.io.signHop = async () => {
+      box.setPenumbra("860");
+      return { hash: "ABCD" };
+    };
+    box.io.channels = {
+      async channelClientState() {
+        return {
+          identifiedClientState: {
+            clientId: "07-tendermint-4",
+            clientState: {
+              unpackTo(target) {
+                target.chainId = "noble-1";
+                target.latestHeight = { revisionNumber: 4n, revisionHeight: 80n };
+                return true;
+              },
+            },
+          },
+        };
+      },
+    };
+    box.io.clients = { clientStatus: async () => ({ status: "Active" }) };
+    const detail = await performStep({ id: "leave" }, { amounts: ["1000"], sliceIndex: 0 }, {
+      findings: { penumbra: true },
+      addresses: accounts,
+    }, box.io);
+    assert.match(detail, /Penumbra holds 0\.00086 USDC\.inj/);
+    assert.equal(plans.length, 2);
+    assert.equal(plans[0].ics20Withdrawals[0].amount.lo, 140n);
+    const memo = JSON.parse(plans[0].ics20Withdrawals[0].ics20Memo);
+    assert.equal(memo.forward.receiver, "osmo1user");
+    assert.equal(memo.forward.next, undefined);
+    assert.equal(box.sends.includes("osmosis-1"), true);
+    const body = new TextDecoder().decode(box.bodies[0]);
+    assert.equal(body.includes("channel-122"), true);
+    assert.equal(body.includes("channel-208"), true);
+    assert.equal(body.includes(hop.address), true);
+    assert.equal(raw, 2);
+    assert.equal(queries.some((url) => url.includes("mint_recipient")), true);
+  });
+
   it("does not sign when the Noble account is missing", async () => {
     const box = harness({ [key("osmo1user", "uosmo")]: "100000" });
+    armHeldGas(box);
+    const wipedKeys = [];
+    box.io.wipeKey = (id) => wipedKeys.push(id);
     const result = await walkMigration({
       input: osmosisInput(),
       ctx: {
@@ -1060,8 +1558,8 @@ describe("walk", () => {
     });
     assert.equal(result.status, "halted");
     assert.match(result.halt.reason, /not connected/);
-    assert.deepEqual(box.sends, []);
-    assert.equal(box.wiped(), 1);
+    assert.deepEqual(box.sends, ["osmosis-1"]);
+    assert.deepEqual(wipedKeys, []);
   });
 });
 
@@ -1111,7 +1609,7 @@ describe("dev return", () => {
     assert.equal(textField(message, 2), "channel-750");
     const coin = readFields(message.find((item) => item.field === 3).value);
     assert.equal(textField(coin, 1), OSMOSIS_USDC_DENOM);
-    assert.equal(textField(coin, 2), "1000000");
+    assert.equal(textField(coin, 2), "990000");
     assert.equal(textField(message, 4), "osmo1user");
     assert.equal(textField(message, 5), "noble1user");
     assert.equal(message.some((item) => item.field === 6), false);
@@ -1130,8 +1628,31 @@ describe("dev return", () => {
     assert.equal(message.some((item) => item.field > 8), false);
   });
 
+  it("uses the live balance and leaves the USDC.noble fee", async () => {
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "1",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "933429",
+    }, { onSend() { box.setNoble("1"); } });
+    const fetchImpl = box.io.fetch;
+    box.io.fetch = async (url, init) => {
+      if (String(url).includes("spot_price_by_denom")) {
+        return response({ poolID: "1464", spot_price: "21.002132398102827266" });
+      }
+      return fetchImpl(url, init);
+    };
+    await returnOsmosisToPenumbra({
+      amountOsmosis: "933608",
+      addresses: { ...accounts, zafu: "penumbra1vault" },
+    }, { ...box.io, ...lightClient() });
+    const coin = readFields(transferMessage(box.bodies[0]).find((item) => item.field === 3).value);
+    assert.equal(textField(coin, 2), "923429");
+  });
+
   it("does not sign when the light client names another chain", async () => {
-    const box = harness({ [key("osmo1user", "uosmo")]: "100000" });
+    const box = harness({
+      [key("osmo1user", "uosmo")]: "100000",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
+    });
     await assert.rejects(
       () => returnOsmosisToPenumbra({
         amountOsmosis: "1000000",
@@ -1185,6 +1706,7 @@ describe("dev return", () => {
   it("shows an Osmosis packet failure and does not wait on Zafu", async () => {
     const box = harness({
       [key("osmo1user", "uosmo")]: "100000",
+      [key("osmo1user", OSMOSIS_USDC_DENOM)]: "1000000",
     }, {
       txResult: {
         tx_response: {

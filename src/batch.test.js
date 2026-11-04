@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ORBITER } from "./circle.js";
-import { INJ_ON_OSMOSIS, NOBLE_TO_OSMOSIS, OSMOSIS_USDC_DENOM } from "./route.js";
+import { orbiterMemo } from "./circle.js";
+import { INJ_ON_OSMOSIS, NOBLE_TO_OSMOSIS } from "./route.js";
 import {
   CROSSCHAIN_SWAP,
   SLICE_GAS,
@@ -15,28 +15,6 @@ import {
 } from "./batch.js";
 
 const asset = new Uint8Array([9, 8, 7]);
-
-function osmosisBody(amount, memo) {
-  return {
-    txs: [{
-      cosmos_tx: {
-        chain_id: "osmosis-1",
-        signer_address: "osmo1user",
-        msgs: [{
-          msg_type_url: "/ibc.applications.transfer.v1.MsgTransfer",
-          msg: JSON.stringify({
-            source_port: "transfer",
-            source_channel: "channel-750",
-            token: { denom: OSMOSIS_USDC_DENOM, amount },
-            sender: "osmo1user",
-            receiver: ORBITER,
-            memo,
-          }),
-        }],
-      },
-    }],
-  };
-}
 
 describe("slice split", () => {
   it("reserves the Penumbra fee and the quoted input", () => {
@@ -92,15 +70,13 @@ describe("slice memos", () => {
     assert.throws(() => feeSwapMemo("inj1hop", "0"), /did not quote the INJ swap/);
   });
 
-  it("copies Skip's burn memo", () => {
-    const raw = JSON.stringify({
-      orbiter: { forwarding: { protocol_id: "PROTOCOL_CCTP", attributes: { destination_domain: 1 } } },
-    });
-    assert.equal(migrationMemo(osmosisBody("900", raw), "osmo1user", "900"), raw);
-    assert.throws(
-      () => migrationMemo(osmosisBody("900", raw), "osmo1user", "1"),
-      /does not burn on arrival/,
-    );
+  it("builds the burn memo for the hop address", () => {
+    const hop = "0x2222222222222222222222222222222222222222";
+    const memo = JSON.parse(migrationMemo(hop));
+    assert.deepEqual(memo, JSON.parse(orbiterMemo(hop)));
+    assert.equal(memo.orbiter.forwarding.attributes.destination_domain, 1);
+    assert.equal("pre_actions" in memo.orbiter, false);
+    assert.throws(() => migrationMemo("inj1hop"), /mint recipient/);
   });
 });
 

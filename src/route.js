@@ -8,21 +8,20 @@
 // USDC.noble that is already outside Penumbra migrates in one move.
 // USDC already on Injective deposits in one move.
 //
-// Circle burns the USDC.noble and mints it on Avalanche. The same Avalanche
-// transaction issues USDC.inj. A balance still on Osmosis returns to Noble in
-// that same transfer: the memo burns it on arrival. That bridge does not sell
-// the USDC into an Osmosis pool.
+// Circle burns the USDC.noble toward Avalanche. The user relays that mint,
+// burns it toward Injective, and relays that mint. A balance still on Osmosis
+// returns to Noble in that same transfer: the memo burns it on arrival. That
+// bridge does not sell the USDC into an Osmosis pool.
 //
-// When the user's Injective wallet cannot pay the IBC, and the USDC is already
-// outside Penumbra, quote the shortfall on Osmosis and bridge that INJ to the
-// wallet. That hop is the first return step. A Penumbra slice buys INJ for its
-// own account and does not use this hop. The pool is quoted when that swap is
-// signed. Circle's burn is quoted when that step runs. The connected Keplr
-// account signs the steps that start outside Penumbra.
+// USDC already outside Penumbra quotes the deposit fee and the Avalanche gas
+// on Osmosis, then bridges both to a new account. A denom already on Osmosis
+// is bridged and not swapped. A Penumbra slice forwards that USDC to the
+// connected Osmosis account first, then runs the same bridge and relays the
+// Noble burn after AVAX arrives. The pool is quoted when that swap is signed.
+// The burn memo is built on this page when that step runs. The connected Keplr
+// account signs the Osmosis transaction.
 
 export const RELEASE_DENOM = "0xa00C59fF5a080D2b954d0c75e46E22a0c371235a";
-export const RELEASE_CHAIN = "1776";
-export const AVALANCHE_CHAIN = "43114";
 export const NOBLE_CHAIN = "noble-1";
 export const USDC_NOBLE_DENOM = "uusdc";
 // Hash of transfer/channel-750/uusdc. This identifies the Osmosis balance.
@@ -31,8 +30,13 @@ export const OSMOSIS_USDC_DENOM =
 // Hash of transfer/channel-122/inj. The fee swap pays this denom out.
 export const INJ_ON_OSMOSIS =
   "ibc/64BA6E31FE887D66C6F8F31C7B1A80C7CA179239677B4088BB55F5EA07DBE273";
+// Hash of the Axelar-wrapped AVAX on Osmosis. The mint's gas is bought as this denom.
+export const WAVAX_ON_OSMOSIS =
+  "ibc/6F62F01D913E3FFE472A38C78235B8F021B511BC6596ADFF02615C8F83D3B373";
 export const OSMOSIS_TO_NOBLE = "channel-750";
 export const NOBLE_TO_OSMOSIS = "channel-1";
+// Noble Orbiter module account. Osmosis sends USDC here so Noble burns on receive.
+export const ORBITER = "noble15xt7kx5mles58vkkfxvf0lq78sw04jajvfgd4d";
 export const OSMOSIS_TO_INJECTIVE = "channel-122";
 export const INJECTIVE_TO_PENUMBRA = "channel-494";
 // Bank denom of native USDC on Injective. The CCTP release still uses the
@@ -88,14 +92,15 @@ export function planFor(findings) {
   const outside = findings.noble || findings.osmosis;
   const pays = findings.penumbra || outside;
   const once = [];
-  if (outside && findings.injGasShort) once.push(gasStep());
+  // The ephemeral account needs INJ and AVAX even when the connected Injective wallet can pay.
+  if (outside) once.push(gasStep());
   if (findings.osmosis) {
     once.push({ id: "gather-osmosis", once: true, hop: "In", title: "Return Osmosis USDC to Noble" });
   }
   if (outside) {
     once.push(
       { id: "cctp-noble", once: true, hop: "In", title: "Burn USDC.noble" },
-      { id: "cctp-forward", once: true, hop: "In", title: "Issue USDC.inj" },
+      { id: "cctp-forward", once: true, hop: "In", title: "Relay the mint" },
     );
   }
   if (outside || findings.usdcInj) {
@@ -155,24 +160,24 @@ export function describeStep(stepId, ctx) {
   const holder = named(ctx, pileRole(findings), "");
   if (stepId === "leave") {
     return {
-      detail: "This slice buys INJ for a new Injective account and burns the rest to that account.",
+      detail: "This slice sends USDC to the Osmosis account for the INJ and AVAX the ephemeral account needs, and burns the rest through Noble. The page then bridges that INJ and AVAX and relays the Noble burn once AVAX arrives.",
       messages: [
         {
           type: "penumbra-withdraw",
           value: {
             asset: "USDC",
-            to: "INJ",
-            amount: "the quoted input",
-            receiver: "a new Injective account",
+            to: "Osmosis",
+            amount: "the quoted INJ and AVAX input",
+            receiver: "the connected Osmosis account",
           },
         },
         {
           type: "penumbra-withdraw",
           value: {
             asset: "USDC",
-            to: "USDC.inj",
+            to: "Avalanche",
             amount: "the remainder",
-            receiver: "a new Injective account",
+            receiver: "the ephemeral Ethereum account",
           },
         },
       ],
@@ -180,18 +185,19 @@ export function describeStep(stepId, ctx) {
   }
   if (stepId === "cctp-noble") {
     return {
-      detail: "Circle burns this USDC.noble and mints it on Avalanche.",
+      detail: "This account burns USDC.noble toward Avalanche. An Osmosis return already carries that burn.",
       messages: [
         {
-          type: "cctpTransfer",
+          type: "/circle.cctp.v1.MsgDepositForBurn",
           value: {
             fromChainId: NOBLE_CHAIN,
-            toChainId: AVALANCHE_CHAIN,
+            destination_domain: 1,
             burn_token: USDC_NOBLE_DENOM,
             asset: "USDC.noble",
             amount: outside,
             signer: addr(holder),
             mint_recipient: addr(a.avalanche),
+            destination_caller: "empty",
           },
         },
       ],
@@ -199,37 +205,29 @@ export function describeStep(stepId, ctx) {
   }
   if (stepId === "cctp-forward") {
     return {
-      detail: "The same Avalanche transaction issues USDC.inj.",
+      detail: "The page waits for the Noble burn, asks Circle for the attestation, and preflights receiveMessage on Avalanche.",
       messages: [
         {
-          type: "cctpTransfer",
-          value: {
-            fromChainId: NOBLE_CHAIN,
-            toChainId: AVALANCHE_CHAIN,
-            state: "CCTP_TRANSFER_RECEIVED",
-            mint_recipient: addr(a.avalanche),
-          },
+          type: "iris",
+          value: { sourceDomain: 4, mint_recipient: addr(a.avalanche) },
         },
         {
-          type: "cctpTransferV2",
+          type: "receiveMessage",
+          value: { domain: 1, caller: "32 zero bytes" },
+        },
+        {
+          type: "depositForBurn",
           value: {
-            fromChainId: AVALANCHE_CHAIN,
-            toChainId: RELEASE_CHAIN,
-            state: "CCTP_TRANSFER_RECEIVED",
-            same_transaction_as_avalanche_receive: true,
+            destinationDomain: 29,
             mint_recipient: addr(a.injEthereum),
+            destinationCaller: "32 zero bytes",
+            maxFee: "0",
+            minFinalityThreshold: 2000,
           },
         },
         {
-          type: "transferAssetRelease",
-          value: {
-            chainId: RELEASE_CHAIN,
-            denom: RELEASE_DENOM,
-            asset: "USDC.inj",
-            amount: outside,
-            released: true,
-            recipient: addr(a.injEthereum),
-          },
+          type: "receiveMessage",
+          value: { domain: 29, caller: "32 zero bytes" },
         },
       ],
     };
@@ -242,8 +240,9 @@ export function describeStep(stepId, ctx) {
           named(ctx, "userOsmosis", USER_OSMOSIS),
           OSMOSIS_USDC_DENOM,
           ctx.amountOsmosis,
-          addr(holder),
+          ORBITER,
           OSMOSIS_TO_NOBLE,
+          "built at signing",
         ),
       ],
     };
@@ -265,7 +264,7 @@ export function describeStep(stepId, ctx) {
   }
   if (stepId === "gas-osmosis") {
     return {
-      detail: "Osmosis buys the INJ the Injective fee still needs. That INJ bridges to the Injective wallet.",
+      detail: "Osmosis buys the INJ the Injective fee still needs. That INJ bridges to a new Injective account, which deposits. AVAX for the Avalanche mint is bought beside it. Axelar relays the AVAX.",
       messages: [
         {
           type: "osmosis/poolmanager/swap-exact-amount-out",

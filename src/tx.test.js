@@ -11,10 +11,11 @@ import {
   pollTx,
   signAndBroadcast,
   signAndBroadcastLocal,
+  transferTimeout,
 } from "./tx.js";
 
 const mint = "AAAAAAAAAAAAAAAAga8VDSpX1SZ/mDgerSSO7C9jhW8=";
-const caller = "AAAAAAAAAAAAAAAA+XAYmOelQwKNR6ORO8GRyuc3EzQ=";
+const caller = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 function textOf(bytes) {
   return new TextDecoder().decode(bytes);
@@ -23,11 +24,12 @@ function textOf(bytes) {
 describe("fees and messages", () => {
   it("uses the published minimum gas price", () => {
     assert.deepEqual(fee("osmosis-1", GAS.transfer), { denom: "uosmo", amount: "7500", gas: "250000" });
-    assert.deepEqual(fee("osmosis-1", GAS.ibc), { denom: "uosmo", amount: "12000", gas: "400000" });
+    assert.deepEqual(fee("osmosis-1", GAS.ibc), { denom: "uosmo", amount: "18000", gas: "600000" });
     assert.deepEqual(fee("osmosis-1", GAS.hook), { denom: "uosmo", amount: "18000", gas: "600000" });
-    assert.equal(fee("osmosis-1", GAS.swap).amount, "12000");
+    assert.equal(fee("osmosis-1", GAS.swap).amount, "18000");
     assert.deepEqual(fee("noble-1", GAS.burn), { denom: "uusdc", amount: "40000", gas: "400000" });
     assert.equal(fee("injective-1", GAS.deposit).amount, "64000000000000");
+    assert.equal(transferTimeout(1_700_000_123) % 60_000_000_000n, 0n);
     assert.throws(() => fee("penumbra-1", 1), /no published fee/);
   });
 
@@ -57,8 +59,24 @@ describe("fees and messages", () => {
         destination_caller: caller,
       },
     });
-    assert.equal(burn.value.includes(24), true);
-    assert.equal(burn.value[burn.value.indexOf(24) + 1], 1);
+    const callerField = new Uint8Array(34);
+    callerField[0] = 50;
+    callerField[1] = 32;
+    let callerAt = -1;
+    for (let index = 0; index <= burn.value.length - callerField.length; index += 1) {
+      let matched = true;
+      for (let offset = 0; offset < callerField.length; offset += 1) {
+        if (burn.value[index + offset] !== callerField[offset]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        callerAt = index;
+        break;
+      }
+    }
+    assert.equal(callerAt >= 0, true);
     assert.throws(
       () => encodeMessage({
         type: "/circle.cctp.v1.MsgDepositForBurn",
@@ -104,8 +122,9 @@ describe("sign", () => {
       async getKey() {
         return { pubKey: new Uint8Array(33).fill(2) };
       },
-      async signDirect(_chainId, _signer, doc) {
+      async signDirect(_chainId, _signer, doc, options) {
         signed.push(doc);
+        signed.options = options;
         if (overrides.reject) throw new Error("User rejected the request");
         return {
           signature: { signature: new Uint8Array(64).fill(3) },
@@ -140,15 +159,19 @@ describe("sign", () => {
       feeAmount: fee("osmosis-1", GAS.transfer),
       lcd: "https://lcd.example",
       wait: { now: () => now, sleep: async (ms) => { now += ms; }, timeoutMs: 1000, intervalMs: 100 },
-      fetchImpl: async (url) => {
+      fetchImpl: async (url, init) => {
         urls.push(String(url));
         if (String(url).includes("/accounts/")) {
           return { ok: true, json: async () => ({ account: { base_account: { account_number: "7", sequence: "3" } } }) };
+        }
+        if (init?.method === "POST") {
+          return { ok: true, json: async () => ({ tx_response: { code: 0, txhash: "04".repeat(32), raw_log: "" } }) };
         }
         return { ok: true, json: async () => ({ tx_response: { code: 0, height: "9", raw_log: "" } }) };
       },
     });
     assert.equal(result.hash, "04".repeat(32));
+    assert.deepEqual(wallet.signed.options, { preferNoSetFee: true });
     assert.equal(wallet.signed[0].accountNumber, "7");
     assert.equal(textOf(wallet.signed[0].bodyBytes).includes("channel-750"), true);
     assert.equal(urls.some((url) => url.includes(result.hash)), true);
@@ -218,10 +241,6 @@ describe("sign", () => {
           async signDirect() {
             return { signature: { signature: new Uint8Array(64).fill(3) } };
           },
-          async sendTx() {
-            const error = { code: 1, log: "error handling packet: see events for details" };
-            throw error;
-          },
         },
         chainId: "osmosis-1",
         signer: "osmo1sender",
@@ -239,9 +258,17 @@ describe("sign", () => {
         lcd: "https://lcd.example",
         onSubmitted(hash) { progress.push(hash); },
         wait: { now: () => 0, sleep: async () => { polls += 1; }, timeoutMs: 1000, intervalMs: 100 },
-        fetchImpl: async (url) => {
+        fetchImpl: async (url, init) => {
           if (String(url).includes("/accounts/")) {
             return { ok: true, json: async () => ({ account: { account_number: "1", sequence: "0" } }) };
+          }
+          if (init?.method === "POST") {
+            return {
+              ok: true,
+              json: async () => ({
+                tx_response: { code: 1, raw_log: "error handling packet: see events for details" },
+              }),
+            };
           }
           polls += 1;
           return { ok: true, json: async () => ({ tx_response: { code: 0, height: "1", raw_log: "" } }) };
@@ -275,9 +302,12 @@ describe("sign", () => {
         lcd: "https://lcd.example",
         onSubmitted(hash) { seen.push(hash); },
         wait: { now: () => now, sleep: async (ms) => { now += ms; }, timeoutMs: 1000, intervalMs: 100 },
-        fetchImpl: async (url) => {
+        fetchImpl: async (url, init) => {
           if (String(url).includes("/accounts/")) {
             return { ok: true, json: async () => ({ account: { account_number: "1", sequence: "0" } }) };
+          }
+          if (init?.method === "POST") {
+            return { ok: true, json: async () => ({ tx_response: { code: 0, txhash: "AB".repeat(32), raw_log: "" } }) };
           }
           return {
             ok: true,
@@ -341,12 +371,12 @@ describe("local injective signature", () => {
         }
         if (init?.method === "POST") {
           posted = JSON.parse(init.body);
-          return { ok: true, json: async () => ({ tx_response: { code: 0, txhash: "AB", raw_log: "" } }) };
+          return { ok: true, json: async () => ({ tx_response: { code: 0, txhash: "AB".repeat(32), raw_log: "" } }) };
         }
         return { ok: true, json: async () => ({ tx_response: { code: 0, height: "9", raw_log: "" } }) };
       },
     });
-    assert.equal(result.hash, "AB");
+    assert.equal(result.hash, "AB".repeat(32));
     assert.equal(digest.length, 32);
     assert.equal(posted.mode, "BROADCAST_MODE_SYNC");
     assert.equal(typeof posted.tx_bytes, "string");

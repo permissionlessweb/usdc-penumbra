@@ -9,13 +9,17 @@ import {
   prepareMigration,
   readDenom,
 } from "./balances.js";
-import { issue, publicKeyOf, signDigest, wipe } from "./custody.js";
+import { heldAccounts, issue, publicKeyOf, signDigest as signHopDigest, wipe } from "./custody.js";
+import { FEE_TOKEN_POOLS } from "./fee-tokens.js";
+import { isAddress } from "@penumbra-zone/bech32m/penumbra";
 import { closedDoors } from "./route.js";
+import { selfRelayLegs } from "./circle.js";
 import { isDevHost } from "./batch.js";
+import { AVALANCHE_RPC } from "./evm.js";
 import { GAS, fee, signAndBroadcastLocal } from "./tx.js";
-import { returnOsmosisToPenumbra, walkMigration } from "./walk.js";
+import { deposit, returnOsmosisToPenumbra, walkMigration } from "./walk.js";
 import { connectKeplr, connectZafu, keplrFingerprint, keplrInstalled, readKeplrKeys, walletToggle, zafuInstalled } from "./wallets.js";
-import { readPenumbraUsdc, zafuAccountId } from "./zafu.js";
+import { diversifiedAddress, readPenumbraUsdc, zafuAccountId } from "./zafu.js";
 import flowSvg from "../figures/flow.svg";
 
 const ROWS = [
@@ -48,12 +52,29 @@ let readGeneration = 0;
 let zafuGeneration = 0;
 let walking = false;
 let walkHeld = false;
+let shownHop = null;
 let accountsDirty = false;
 let accountTick = false;
 let connecting = false;
 const PENUMBRA = Symbol.for("penumbra");
 const KEPLR_PICKS = ["osmosis", "noble", "usdcInj"];
 const picks = {};
+let shieldTo = "";
+let shieldIndex = null;
+
+async function deriveShield(index) {
+  if (!zafu?.view) return;
+  const account = Math.max(0, Math.floor(index));
+  try {
+    shieldTo = await diversifiedAddress(zafu.view, account);
+    shieldIndex = account;
+  } catch (error) {
+    beginStatus.textContent = error instanceof Error ? error.message : String(error);
+    beginStatus.classList.add("error");
+    return;
+  }
+  paintBalances();
+}
 const readings = {};
 for (const row of ROWS) readings[row.id] = { state: "unread", amount: "0", text: "Not read." };
 readings.uosmo = { state: "unread", amount: "0", text: "Not read." };
@@ -128,6 +149,18 @@ function timing() {
   };
 }
 
+function shieldError() {
+  const typed = shieldTo.trim();
+  if (!typed) return "";
+  return isAddress(typed) ? "" : "That is not a Penumbra address.";
+}
+
+function depositReceiver() {
+  const typed = shieldTo.trim();
+  if (typed && isAddress(typed)) return typed;
+  return zafu?.connected ? zafu.address || "" : "";
+}
+
 function snapshot() {
   const key = (chainId) => keplr?.keys?.find((item) => item.chainId === chainId);
   const noble = key("noble-1")?.bech32Address || "";
@@ -136,7 +169,7 @@ function snapshot() {
   return {
     ...readings,
     addresses: {
-      zafu: zafu?.connected ? zafu.address : "",
+      zafu: depositReceiver(),
       userOsmosis: key("osmosis-1")?.bech32Address || "",
       userNoble: noble,
       userInj: inj,
@@ -160,16 +193,6 @@ function penumbraAmountText(reading) {
   return `${noble} USDC.noble · ${inj} USDC.inj`;
 }
 
-function fillMax() {
-  for (const row of ROWS) {
-    if (row.id === "inj") continue;
-    const reading = readings[row.id];
-    picks[row.id] = reading.state === "ready" && BigInt(reading.amount) > 0n
-      ? formatUnits(reading.amount, decimalsFor(row))
-      : "";
-  }
-}
-
 function clampPicks(ids) {
   for (const row of ROWS) {
     if (row.id === "inj") continue;
@@ -177,10 +200,7 @@ function clampPicks(ids) {
     const reading = readings[row.id];
     if (reading.state !== "ready") continue;
     const current = picks[row.id];
-    if (current == null || current.trim() === "") {
-      picks[row.id] = BigInt(reading.amount) > 0n ? formatUnits(reading.amount, decimalsFor(row)) : "";
-      continue;
-    }
+    if (current == null || current.trim() === "") continue;
     try {
       if (BigInt(parseUnits(current, decimalsFor(row))) > BigInt(reading.amount)) {
         picks[row.id] = formatUnits(reading.amount, decimalsFor(row));
@@ -189,15 +209,6 @@ function clampPicks(ids) {
       // The field keeps the text. Begin explains it.
     }
   }
-}
-
-function writePick(row, replace) {
-  const reading = readings[row.id];
-  const next = reading.state === "ready" && BigInt(reading.amount) > 0n
-    ? formatUnits(reading.amount, decimalsFor(row))
-    : "";
-  if (!replace && picks[row.id] != null && String(picks[row.id]).trim() !== "") return;
-  picks[row.id] = next;
 }
 
 function chosenBase() {
@@ -226,6 +237,13 @@ function chosenBase() {
 function syncBegin() {
   const penumbra = readings.penumbra;
   slices.hidden = !(penumbra.state === "ready" && BigInt(penumbra.amount) > 0n);
+  const shield = shieldError();
+  if (shield) {
+    beginButton.disabled = true;
+    restartButton.disabled = walking;
+    readButton.disabled = walking;
+    return { ready: false, reason: shield, steps: [], moved: "0" };
+  }
   const picked = chosenBase();
   if (picked.error) {
     beginButton.disabled = true;
@@ -254,8 +272,11 @@ function syncDev(picked) {
   devActions.hidden = false;
   const amount = picked?.chosen?.osmosis;
   const osmosisReady = readings.osmosis.state === "ready" && amount && BigInt(amount) > 0n;
-  const gasReady = readings.uosmo.state === "ready"
-    && BigInt(readings.uosmo.amount) >= BigInt(fee("osmosis-1", GAS.hook).amount);
+  const usdcCanPay = osmosisReady && Boolean(FEE_TOKEN_POOLS[OSMOSIS_USDC_DENOM]);
+  const gasReady = usdcCanPay || (
+    readings.uosmo.state === "ready"
+    && BigInt(readings.uosmo.amount) >= BigInt(fee("osmosis-1", GAS.hook).amount)
+  );
   devReturn.disabled = walking || Boolean(picked?.error) || !zafu?.connected || !osmosisReady || !gasReady;
 }
 
@@ -281,10 +302,21 @@ function paintBalances() {
     place.append(label);
     const account = addressFor(row);
     if (account) {
-      const addr = document.createElement("span");
+      const addr = document.createElement("button");
+      addr.type = "button";
       addr.className = "addr";
       addr.textContent = abbreviate(account);
       addr.title = account;
+      addr.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(account);
+          const shown = addr.textContent;
+          addr.textContent = "Copied";
+          setTimeout(() => { addr.textContent = shown; }, 1200);
+        } catch {
+          addr.title = account;
+        }
+      });
       place.append(addr);
     }
     const amount = document.createElement("span");
@@ -315,6 +347,43 @@ function paintBalances() {
       });
       pick.append(field, max);
       item.append(pick);
+    }
+    if (row.id === "penumbra") {
+      const shield = document.createElement("input");
+      shield.type = "text";
+      shield.className = "shield";
+      shield.autocomplete = "off";
+      shield.spellcheck = false;
+      shield.placeholder = "Diversified address";
+      shield.setAttribute("aria-label", "Diversified Penumbra address");
+      shield.value = shieldTo;
+      shield.addEventListener("input", () => {
+        shieldTo = shield.value;
+        if (walking) return;
+        plan.replaceChildren();
+        const prep = syncBegin();
+        beginStatus.classList.remove("error");
+        beginStatus.textContent = prep.ready ? "" : prep.reason;
+      });
+      const controls = document.createElement("div");
+      controls.className = "shield-controls";
+      const label = document.createElement("span");
+      label.textContent = shieldIndex == null ? "Account" : `Account ${shieldIndex}`;
+      const current = shieldIndex ?? 0;
+      for (const [text, next] of [
+        ["Previous", Math.max(0, current - 1)],
+        ["Next", current + 1],
+        ["Random", Math.floor(Math.random() * 0x80000000)],
+      ]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "ghost";
+        button.textContent = text;
+        button.addEventListener("click", () => { deriveShield(next); });
+        controls.append(button);
+      }
+      controls.prepend(label);
+      item.append(shield, controls);
     }
     balanceList.append(item);
   }
@@ -381,22 +450,8 @@ async function readBalances(options = {}) {
   if (bank) keplrRows.forEach((row, index) => { readings[row.id] = bank[index]; });
   if (shield) readings.penumbra = shield;
   if (uosmo) readings.uosmo = uosmo;
-  if (!scope) {
-    if (options.keepPicks || hold) clampPicks();
-    else fillMax();
-  } else {
-    const ids = scope === "penumbra" ? ["penumbra"] : KEPLR_PICKS;
-    if (options.replacePicks) {
-      for (const row of ROWS) {
-        if (ids.includes(row.id)) writePick(row, true);
-      }
-    } else if (options.keepPicks || hold) clampPicks(ids);
-    else {
-      for (const row of ROWS) {
-        if (ids.includes(row.id)) writePick(row, false);
-      }
-    }
-  }
+  if (!scope) clampPicks();
+  else clampPicks(scope === "penumbra" ? ["penumbra"] : KEPLR_PICKS);
   const prep = paintBalances();
   if (hold) {
     beginButton.disabled = true;
@@ -476,11 +531,21 @@ function liveIo() {
           intervalMs: 4000,
         },
         pubKey: publicKeyOf(keyId),
-        signDigest: (digest) => signDigest(keyId, digest),
+        signDigest: (digest) => signHopDigest(keyId, digest),
       });
     },
     wipeKey(keyId) {
       wipe(keyId);
+    },
+    signDigest(keyId, digest) {
+      return signHopDigest(keyId, digest);
+    },
+    ethereum: globalThis.ethereum || null,
+    onAccount() {
+      return readBalances({ hold: true, keepPicks: true });
+    },
+    onHop(hop) {
+      paintHop(hop);
     },
     wipeNoted(run) {
       let count = 0;
@@ -494,6 +559,35 @@ function liveIo() {
   };
 }
 
+function paintHop(hop) {
+  const box = document.querySelector("#hop");
+  const address = document.querySelector("#hop-address");
+  const lines = document.querySelector("#hop-lines");
+  const depositButton = document.querySelector("#hop-deposit");
+  if (!box || !address || !lines || !hop?.address) return;
+  shownHop = hop.keyId ? hop : shownHop;
+  box.hidden = false;
+  address.textContent = hop.address;
+  const avax = hop.avax == null ? "not read" : `${formatUnits(hop.avax, 18)} AVAX`;
+  lines.textContent = `${formatUnits(hop.inj || 0n, 18)} INJ. ${formatUnits(hop.usdc || 0n, 6)} USDC.inj. ${avax}. ${hop.ethereum || ""}`;
+  if (!depositButton) return;
+  const feeInj = BigInt(fee("injective-1", GAS.deposit).amount);
+  const usdc = BigInt(hop.usdc || 0n);
+  const inj = BigInt(hop.inj || 0n);
+  depositButton.hidden = !hop.keyId || usdc < 1n;
+  depositButton.disabled = walking || inj < feeInj;
+  depositButton.title = inj < feeInj ? "INJ is below the transaction fee." : "";
+}
+
+async function reopenZafu() {
+  const next = await connectZafu();
+  if (!next?.connected || !next.view) throw new Error("Zafu is not connected.");
+  const previous = zafu;
+  zafu = next;
+  previous?.close?.();
+  paintZafu();
+}
+
 function paintWalk(view) {
   paintPlan(view.rows);
   if (view.status === "halted") beginStatus.textContent = view.halt?.reason || "Stopped.";
@@ -501,7 +595,7 @@ function paintWalk(view) {
   else if (view.status === "waiting") beginStatus.textContent = "Waiting.";
   else {
     const current = view.rows.find((row) => row.state === "running");
-    beginStatus.textContent = current?.title || "Signing.";
+    beginStatus.textContent = current?.detail || current?.title || "Signing.";
   }
 }
 
@@ -640,6 +734,44 @@ async function refreshZafuFromExtension() {
   await readBalances({ scope: "penumbra", replacePicks: true });
 }
 
+async function readHopBalances(hop) {
+  let inj = 0n;
+  let usdc = 0n;
+  let avax = null;
+  try {
+    inj = BigInt(await readDenom(globalThis.fetch.bind(globalThis), LCD["injective-1"], hop.address, "inj"));
+    usdc = BigInt(await readDenom(globalThis.fetch.bind(globalThis), LCD["injective-1"], hop.address, INJ_USDC_DENOM));
+  } catch {
+    // The address is still shown when the balance query misses.
+  }
+  try {
+    const response = await fetch(AVALANCHE_RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [hop.ethereum, "latest"] }),
+    });
+    const body = await response.json();
+    if (typeof body?.result === "string" && /^0x[0-9a-fA-F]+$/.test(body.result)) avax = BigInt(body.result);
+  } catch {
+    avax = null;
+  }
+  return { ...hop, inj, usdc, avax };
+}
+
+async function refreshStoredHop() {
+  const saved = heldAccounts().filter((account) => account.chain === "injective" && account.ethereum);
+  if (!saved.length) {
+    shownHop = null;
+    const box = document.querySelector("#hop");
+    if (box) box.hidden = true;
+    return;
+  }
+  const read = [];
+  for (const account of saved.slice(-5)) read.push(await readHopBalances(account));
+  const funded = read.filter((hop) => hop.usdc >= 1n);
+  paintHop(funded.length ? funded[funded.length - 1] : read[read.length - 1]);
+}
+
 async function tickAccounts(forcePort) {
   if (walking || connecting) {
     if (walking) accountsDirty = true;
@@ -651,6 +783,7 @@ async function tickAccounts(forcePort) {
     await watchKeplrAccounts();
     if (forcePort) await refreshZafuFromExtension();
     else await watchOpenZafu();
+    if (!walking) await refreshStoredHop();
   } finally {
     accountTick = false;
   }
@@ -699,6 +832,7 @@ document.querySelector("#zafu").addEventListener("click", async () => {
     zafu = next;
     previous?.close?.();
     paintZafu();
+    if (!shieldTo.trim()) await deriveShield(Math.floor(Math.random() * 0x80000000));
     await readBalances({ scope: "penumbra", announce: true });
   } finally {
     connecting = false;
@@ -805,6 +939,60 @@ devReturn?.addEventListener("click", async () => {
   }
 });
 
+document.querySelector("#hop-deposit")?.addEventListener("click", async () => {
+  if (walking || !shownHop?.keyId) return;
+  const receiver = depositReceiver();
+  if (!isAddress(receiver)) {
+    beginStatus.classList.add("error");
+    beginStatus.textContent = zafu?.connected ? "That is not a Penumbra address." : "Zafu is not connected.";
+    return;
+  }
+  const hop = shownHop;
+  walking = true;
+  paintHop(hop);
+  beginStatus.classList.remove("error");
+  beginStatus.textContent = "Depositing the held account.";
+  let detail = "";
+  let failed = false;
+  try {
+    detail = await deposit({
+      depositHop: hop,
+      finishHeld: true,
+      hopBroadcast: true,
+      findings: { penumbra: true, noble: false, osmosis: false, usdcInj: false },
+      arrivedInj: "0",
+      addresses: { zafu: receiver },
+    }, {
+      ...liveIo(),
+      reconnectZafu: reopenZafu,
+      onProgress(text) {
+        beginStatus.classList.remove("error");
+        beginStatus.textContent = text;
+      },
+    });
+    beginStatus.textContent = detail;
+  } catch (error) {
+    failed = true;
+    const message = error instanceof Error ? error.message : String(error);
+    detail = message.includes("still held")
+      ? message
+      : `${message} The Injective account ${hop.address} is still held for this page session.`;
+    beginStatus.textContent = detail;
+    beginStatus.classList.add("error");
+  } finally {
+    walking = false;
+    try {
+      await refreshStoredHop();
+      await readBalances({ hold: true, keepPicks: true });
+    } finally {
+      beginStatus.textContent = detail;
+      beginStatus.classList.toggle("error", failed);
+      if (walkHeld) beginButton.disabled = true;
+      else syncBegin();
+    }
+  }
+});
+
 beginButton.addEventListener("click", async () => {
   if (walking || walkHeld) return;
   const prep = syncBegin();
@@ -869,3 +1057,30 @@ for (const line of closedDoors()) {
 paintZafu();
 paintKeplr();
 paintBalances();
+refreshStoredHop();
+
+function paintLegs() {
+  const bytes = new Uint8Array(20);
+  crypto.getRandomValues(bytes);
+  const mint = `0x${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  const note = document.querySelector("#legs-note");
+  const list = document.querySelector("#legs-list");
+  if (!note || !list) return;
+  note.textContent = `Example shape for 1 USDC. The amount 1000000 is that shape in base units, not a balance. The mint recipient ${mint} was generated in this page. It is not a key. Nothing on this list is signed or broadcast.`;
+  list.replaceChildren();
+  for (const leg of selfRelayLegs(mint, "1000000")) {
+    const item = document.createElement("li");
+    const title = document.createElement("h3");
+    title.textContent = leg.title;
+    const signs = document.createElement("p");
+    signs.textContent = leg.signs;
+    const relay = document.createElement("p");
+    relay.textContent = leg.relay;
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(leg.detail, null, 2);
+    item.append(title, signs, relay, pre);
+    list.append(item);
+  }
+}
+
+paintLegs();

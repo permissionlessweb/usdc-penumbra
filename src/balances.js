@@ -12,13 +12,14 @@ import {
   migrateAmount,
   signingGaps,
 } from "./route.js";
+import { FEE_TOKEN_POOLS } from "./fee-tokens.js";
 import { GAS, fee } from "./tx.js";
 
 export { INJ_USDC_DENOM, OSMOSIS_USDC_DENOM, USDC_NOBLE_DENOM };
 export const INJ_DENOM = "inj";
 
 export const LCD = {
-  "osmosis-1": "https://lcd.osmosis.zone",
+  "osmosis-1": "https://osmosis-api.polkachu.com",
   "noble-1": "https://noble-api.polkachu.com",
   "injective-1": "https://lcd.injective.network",
 };
@@ -155,10 +156,14 @@ export function prepareMigration(readings, timing = {}) {
   }
   const gasNeed = osmosisGasRequired(steps);
   if (gasNeed > 0n) {
-    if (readings.uosmo?.state !== "ready") {
+    const usdcCanPay = Boolean(FEE_TOKEN_POOLS[OSMOSIS_USDC_DENOM])
+      && readings.osmosis?.state === "ready"
+      && BigInt(readings.osmosis.amount) > 0n;
+    const uosmoReady = readings.uosmo?.state === "ready";
+    if (!usdcCanPay && !uosmoReady) {
       return { ready: false, reason: "Osmosis gas is not read.", steps: [], moved: "0" };
     }
-    if (BigInt(readings.uosmo.amount) < gasNeed) {
+    if (!usdcCanPay && BigInt(readings.uosmo.amount) < gasNeed) {
       return { ready: false, reason: "Osmosis gas is short.", steps, moved };
     }
   }
@@ -171,7 +176,8 @@ export function osmosisGasRequired(steps) {
   const hook = BigInt(fee("osmosis-1", GAS.hook).amount);
   let need = 0n;
   for (const step of steps) {
-    if (step.id === "gas-osmosis") need += swap + ibc;
+    // One transaction: two swaps and two bridges, 600000 gas each.
+    if (step.id === "gas-osmosis") need += (swap + ibc) * 2n;
     if (step.id === "gather-osmosis") need += hook;
   }
   return need;

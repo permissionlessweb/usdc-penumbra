@@ -127,8 +127,9 @@ export async function nobleForwardChannel(view, channels, clients) {
   return named[0];
 }
 
-export async function diversifiedAddress(viewClient) {
-  const { address } = await viewClient.addressByIndex({});
+export async function diversifiedAddress(viewClient, account) {
+  const request = Number.isInteger(account) ? { addressIndex: { account } } : {};
+  const { address } = await viewClient.addressByIndex(request);
   return formatDiversifiedAddress(address);
 }
 

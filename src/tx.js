@@ -10,11 +10,12 @@ const textEncoder = new TextEncoder();
 
 export const GAS = {
   transfer: 250000,
-  // An Osmosis IBC packet for an ibc/ denom used 250937 at a 250000 limit.
-  ibc: 400000,
-  // That packet plus the Orbiter memo. The memo is about 530 bytes.
+  // Swap and bridge actions. A plain transfer's median was lower; the
+  // Axelar memo and the exact-out swap are signed at this limit.
+  ibc: 600000,
+  // That packet plus the Orbiter memo.
   hook: 600000,
-  swap: 400000,
+  swap: 600000,
   burn: 400000,
   deposit: 400000,
 };
@@ -32,8 +33,12 @@ function coinFee(denom, gas, numerator, denominator) {
   return { denom, amount: amount.toString(), gas: limit.toString() };
 }
 
+// Unix nanoseconds, ten minutes ahead, rounded down to one minute.
+// A packet timestamp that is not a multiple of one minute is rejected.
 export function transferTimeout(nowMs) {
-  return BigInt(nowMs + 10 * 60 * 1000) * 1000000n;
+  const minute = 60_000_000_000n;
+  const nanos = BigInt(Math.floor(nowMs)) * 1_000_000n + 600n * 1_000_000_000n;
+  return (nanos / minute) * minute;
 }
 
 function concat(parts) {
@@ -295,32 +300,26 @@ export function txFailureMessage(code, log, details = []) {
   return parts.join(" ");
 }
 
-function broadcastFailure(error) {
-  if (error instanceof Error) {
-    const message = error.message || "";
-    if (/reject/i.test(message)) return "The signature was declined.";
-    return message || "The transaction failed.";
+export async function broadcastSigned(fetchImpl, lcd, raw) {
+  const response = await fetchImpl(`${lcd}/cosmos/tx/v1beta1/txs`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tx_bytes: bytesToBase64(raw), mode: "BROADCAST_MODE_SYNC" }),
+  });
+  let body = {};
+  try {
+    body = await response.json();
+  } catch {
+    body = {};
   }
-  if (error && typeof error === "object") {
-    const code = error.code ?? error.tx_response?.code ?? error.txResponse?.code;
-    const tx = error.tx_response || error.txResponse || error;
-    const log = tx.raw_log || tx.rawLog || tx.log || error.log || error.message || "";
-    if (code != null && Number(code) !== 0) return txFailureMessage(Number(code), log, eventDetails(tx));
-    if (log) return String(log);
+  const tx = body.tx_response || body.txResponse || {};
+  const code = tx.code == null ? response.status : Number(tx.code);
+  if (!response.ok || code !== 0) {
+    throw new Error(txFailureMessage(code, tx.raw_log || tx.rawLog || "", eventDetails(tx)));
   }
-  const text = String(error ?? "");
-  if (!text || text === "[object Object]") return "The transaction failed.";
-  if (/reject/i.test(text)) return "The signature was declined.";
-  return text;
-}
-
-// Sync mode can return the hash, or a CheckTx body when the node rejected it.
-function broadcastRejection(result) {
-  if (!result || typeof result !== "object" || result instanceof Uint8Array) return "";
-  const code = result.code ?? result.tx_response?.code ?? result.txResponse?.code;
-  if (code == null || Number(code) === 0) return "";
-  const tx = result.tx_response || result.txResponse || result;
-  return txFailureMessage(Number(code), tx.raw_log || tx.rawLog || tx.log || result.log || "", eventDetails(tx));
+  const hash = String(tx.txhash || tx.txHash || "").replace(/^0x/i, "").toUpperCase();
+  if (!/^[0-9A-F]{64}$/.test(hash)) throw new Error("The transaction was not found.");
+  return hash;
 }
 
 export async function pollTx(fetchImpl, lcd, hash, wait) {
@@ -368,12 +367,15 @@ export async function signAndBroadcast({
   });
   let signed;
   try {
+    // Keplr otherwise replaces this fee with its own simulation.
+    // That simulation has been signing 400000 gas, and the real
+    // ReadFlat then runs out.
     signed = await keplr.signDirect(chainId, signer, {
       bodyBytes,
       authInfoBytes,
       chainId,
       accountNumber: account.accountNumber,
-    });
+    }, { preferNoSetFee: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/reject/i.test(message)) throw new Error("The signature was declined.");
@@ -385,24 +387,11 @@ export async function signAndBroadcast({
     asBytes(signed?.signed?.authInfoBytes || authInfoBytes),
     [signature],
   );
-  let broadcast;
-  try {
-    broadcast = await keplr.sendTx(chainId, raw, "sync");
-  } catch (error) {
-    throw new Error(broadcastFailure(error));
-  }
-  const rejected = broadcastRejection(broadcast);
-  if (rejected) throw new Error(rejected);
-  const hash = txHashOf(broadcast);
+  const hash = await broadcastSigned(fetchImpl, lcd, raw);
   onSubmitted?.(hash);
   const result = await pollTx(fetchImpl, lcd, hash, wait);
   if (result.code !== 0) throw new Error(txFailureMessage(result.code, result.log, result.details));
   return { hash };
-}
-
-function txHashOf(result) {
-  if (typeof result === "string") return result.replace(/^0x/i, "").toUpperCase();
-  return bytesToHex(asBytes(result));
 }
 
 export async function signAndBroadcastLocal({
@@ -432,23 +421,7 @@ export async function signAndBroadcastLocal({
     throw new Error("The signature was declined.");
   }
   const raw = txRaw(bodyBytes, authInfoBytes, [signature]);
-  const response = await fetchImpl(`${lcd}/cosmos/tx/v1beta1/txs`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ tx_bytes: bytesToBase64(raw), mode: "BROADCAST_MODE_SYNC" }),
-  });
-  let body = {};
-  try {
-    body = await response.json();
-  } catch {
-    body = {};
-  }
-  const tx = body.tx_response || body.txResponse || {};
-  if (!response.ok || Number(tx.code) !== 0) {
-    throw new Error(txFailureMessage(tx.code ?? response.status, tx.raw_log || tx.rawLog || "", eventDetails(tx)));
-  }
-  const hash = String(tx.txhash || tx.txHash || "").replace(/^0x/i, "").toUpperCase();
-  if (!hash) throw new Error("The transaction was not found.");
+  const hash = await broadcastSigned(fetchImpl, lcd, raw);
   const result = await pollTx(fetchImpl, lcd, hash, wait);
   if (result.code !== 0) throw new Error(txFailureMessage(result.code, result.log, result.details));
   return { hash };

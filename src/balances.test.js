@@ -75,27 +75,34 @@ describe("prepare", () => {
       "Buy INJ for the Injective fee",
       "Return Osmosis USDC to Noble",
       "Burn USDC.noble",
-      "Issue USDC.inj",
+      "Relay the mint",
       "Enter Penumbra",
       "Wipe the inbound keys",
     ]);
     assert.match(prep.steps[0].detail, /buys the INJ the Injective fee still needs/);
     assert.match(prep.steps[1].detail, /burns it on arrival/);
-    assert.match(prep.steps[2].detail, /Circle burns/);
-    assert.match(prep.steps[3].detail, /same Avalanche transaction/);
+    assert.match(prep.steps[2].detail, /burns USDC\.noble toward Avalanche/);
+    assert.match(prep.steps[3].detail, /preflights receiveMessage/);
     assert.equal(prep.steps.some((step) => step.gaps.length > 0), true);
   });
 
-  it("skips the hop when the Injective wallet can pay the fee", () => {
+  it("still buys for the ephemeral account when the Injective wallet can pay", () => {
     const prep = prepareMigration(ready({ osmosis: empty("1000000"), inj: empty(INJ_FEE) }));
-    assert.equal(prep.steps.some((step) => step.title === "Buy INJ for the Injective fee"), false);
+    assert.equal(prep.steps[0].id, "gas-osmosis");
     assert.equal(prep.moved, "1000000");
   });
 
-  it("stops when the Osmosis wallet cannot pay gas", () => {
-    const prep = prepareMigration(ready({
+  it("lets USDC.noble pay Osmosis gas and stops when neither balance can", () => {
+    const paid = prepareMigration(ready({
       osmosis: empty("1000000"),
       inj: empty(INJ_FEE),
+      uosmo: empty("0"),
+    }));
+    assert.equal(paid.ready, true);
+    const prep = prepareMigration(ready({
+      osmosis: empty("0"),
+      noble: empty("1000000"),
+      inj: empty("0"),
       uosmo: empty("0"),
     }));
     assert.equal(prep.ready, false);
@@ -108,14 +115,14 @@ describe("prepare", () => {
     assert.equal(unread.reason, "Osmosis gas is not read.");
   });
 
-  it("does not ask for Osmosis gas when Osmosis does not move", () => {
+  it("asks for Osmosis gas when Noble USDC will fund the ephemeral account", () => {
     const prep = prepareMigration(ready({
       noble: empty("1000000"),
       inj: empty(INJ_FEE),
       uosmo: { state: "unread", amount: "0", text: "Not read." },
     }));
-    assert.equal(prep.ready, true);
-    assert.equal(prep.steps.some((step) => step.id === "gas-osmosis" || step.id === "gather-osmosis"), false);
+    assert.equal(prep.ready, false);
+    assert.equal(prep.reason, "Osmosis gas is not read.");
   });
 
   it("includes the hop when INJ is below the fee", () => {

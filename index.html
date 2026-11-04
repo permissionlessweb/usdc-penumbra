@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src https://lcd.osmosis.zone https://noble-api.polkachu.com https://lcd.injective.network https://sqs.osmosis.zone https://api.skip.build; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src https://osmosis-api.polkachu.com https://noble-api.polkachu.com https://lcd.injective.network https://sqs.osmosis.zone https://iris-api.circle.com https://api.avax.network https://api.axelarscan.io; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
     />
     <title>USDC</title>
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
@@ -49,11 +49,23 @@
         <div class="actions" id="dev-actions" hidden>
           <button class="ghost" id="dev-return" type="button" disabled>Return Osmosis USDC to Penumbra</button>
         </div>
+        <div id="hop" hidden>
+          <p class="kicker">Ephemeral account</p>
+          <p id="hop-address" class="addr"></p>
+          <p id="hop-lines"></p>
+          <button class="ghost" id="hop-deposit" type="button" hidden>Deposit to Penumbra</button>
+        </div>
         <p id="begin-status"></p>
         <ol id="plan"></ol>
       </section>
 
       <figure id="flow"></figure>
+
+      <section class="legs" id="legs" aria-label="Self relay">
+        <p class="kicker">Self relay</p>
+        <p id="legs-note"></p>
+        <ol id="legs-list"></ol>
+      </section>
     </div>
 
     <dialog id="notes">
@@ -73,27 +85,31 @@
       <p>Migrate USDC.noble into USDC.inj.</p>
       <p>Return a balance on Osmosis to Noble with the burn in that transfer.</p>
       <p>The Noble account does not pay a fee for that burn.</p>
-      <p>Circle burns USDC.noble that is already on Noble and issues USDC.inj.</p>
-      <p>Choose an amount on each balance.</p>
+      <p>Circle burns USDC.noble that is already on Noble. The page preflights and submits the Avalanche mint once Circle has attested that Noble burn, then burns toward Injective.</p>
+      <p>The page does not ask a solver to relay. Axelar relays the AVAX that pays for the Avalanche mint.</p>
+      <p>Choose an amount on each balance. An empty field stays empty.</p>
       <p>Max uses the full balance.</p>
-      <p>Send the funds to a diversified address of the Zafu account.</p>
+      <p>The connected address copies when it is clicked.</p>
+      <p>Send the funds to a diversified address of the Zafu account. Previous, Next, and Random ask Zafu for that account. Type another diversified address to shield there instead.</p>
       <p>The deposit asks Zafu until that Penumbra balance increases.</p>
-      <p>A Penumbra slice signs the fee withdrawal, then signs the migration. The first buys the fee for a new Injective account. The second burns the rest to that account. That account deposits to the same Zafu address.</p>
+      <p>A Penumbra slice signs the fee withdrawal, then signs the migration. The first sends USDC to the Osmosis account. The second burns the rest through Noble to a new account. That account's INJ and AVAX are bridged from Osmosis, and the page relays the Noble burn after AVAX arrives.</p>
       <p>Privacy starts in Penumbra.</p>
-      <p>When the Injective wallet cannot pay the fee, buy that INJ on Osmosis first.</p>
-      <p>Bridge that INJ to the Injective wallet.</p>
-      <p>Skip the swap when that wallet can already pay the fee.</p>
+      <p>When the Injective wallet cannot pay the fee, buy INJ for a new account and buy AVAX for the Avalanche mint.</p>
+      <p>Bridge that INJ to the new account. Axelar relays the AVAX.</p>
+      <p>Leave the swap out when Osmosis already holds that INJ or AVAX, and bridge the balance instead.</p>
+      <p>Osmosis can take its fee in USDC.noble when that balance covers the converted fee.</p>
       <h3>This cut</h3>
       <ul id="cut"></ul>
       <p>Begin asks the wallet to sign the running step.</p>
       <p>A step that cannot be signed stops. Later steps do not run.</p>
       <p>A stopped step stays on the page. Restart reads the balances again.</p>
+      <p>When the ephemeral account already holds USDC.inj, Deposit to Penumbra sends that balance. The key stays until Zafu shows the increase.</p>
       <p>Osmosis does not move until that wallet can pay the gas.</p>
       <p>The fee swap is quoted at that step. A quote that does not pay INJ is not signed.</p>
       <p>Circle burns USDC.noble. A route that sells the balance into a pool is not signed.</p>
       <button class="ghost" id="notes-close" type="button">Close</button>
     </dialog>
 
-    <script type="module" src="dist/app.js"></script>
+    <script type="module" src="dist/app.js?v=20261104-held"></script>
   </body>
 </html>

@@ -38,6 +38,8 @@ describe("diversified address", () => {
     };
     assert.equal(await diversifiedAddress(view), text);
     assert.deepEqual(request, {});
+    await diversifiedAddress(view, 7);
+    assert.deepEqual(request, { addressIndex: { account: 7 } });
   });
 
   it("accepts an address string when the bytes are absent", () => {

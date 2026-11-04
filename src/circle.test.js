@@ -1,141 +1,94 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { OSMOSIS_USDC_DENOM, RELEASE_DENOM } from "./route.js";
-import { ORBITER, assertCircleRoute, assertOsmosisCircleRoute, circleMessages, osmosisTransfer } from "./circle.js";
+import { OSMOSIS_USDC_DENOM } from "./route.js";
+import { encodeMessage } from "./tx.js";
+import {
+  AVALANCHE_DOMAIN,
+  AVALANCHE_MESSAGE_TRANSMITTER_V1,
+  AVALANCHE_TOKEN_MESSENGER_V2,
+  INJECTIVE_DOMAIN,
+  INJECTIVE_MESSAGE_TRANSMITTER_V2,
+  ORBITER,
+  bytesToBase64,
+  cctpMessageHash,
+  irisAttestationUrl,
+  nobleBurnMessage,
+  orbiterMemo,
+  readIris,
+  selfRelayLegs,
+  zeroBytes32,
+} from "./circle.js";
 
-const mint = "AAAAAAAAAAAAAAAAga8VDSpX1SZ/mDgerSSO7C9jhW8=";
-const caller = "AAAAAAAAAAAAAAAA+XAYmOelQwKNR6ORO8GRyuc3EzQ=";
-const signer = "noble1dyw0geqa2cy0ppdjcxfpzusjpwmq85r5a35hqe";
+const mint = "0x1111111111111111111111111111111111111111";
 
-function route(overrides = {}) {
-  return {
-    does_swap: false,
-    swap_venues: [],
-    txs_required: 1,
-    operations: [
-      { cctp_transfer: { from_chain_id: "noble-1", burn_token: "uusdc" } },
-      { cctp_transfer_v2: { to_chain_id: "1776", denom_out: RELEASE_DENOM } },
-    ],
-    ...overrides,
-  };
-}
-
-function body(type = "/circle.cctp.v1.MsgDepositForBurnWithCaller") {
-  return {
-    txs: [{
-      cosmos_tx: {
-        chain_id: "noble-1",
-        signer_address: signer,
-        msgs: [
-          {
-            msg_type_url: type,
-            msg: JSON.stringify({
-              from: signer,
-              amount: "980000",
-              destination_domain: 1,
-              mint_recipient: mint,
-              burn_token: "uusdc",
-              destination_caller: caller,
-            }),
-          },
-          {
-            msg_type_url: "/cosmos.bank.v1beta1.MsgSend",
-            msg: JSON.stringify({
-              from_address: signer,
-              to_address: signer,
-              amount: [{ denom: "uusdc", amount: "20000" }],
-            }),
-          },
-        ],
-      },
-    }],
-  };
-}
-
-describe("circle", () => {
-  it("accepts a burn that does not swap and returns the noble messages", () => {
-    assert.equal(assertCircleRoute(route()).txs_required, 1);
-    const tx = circleMessages(body());
-    assert.equal(tx.chainId, "noble-1");
-    assert.equal(tx.signer, signer);
-    assert.equal(tx.messages.length, 2);
-    assert.equal(tx.messages[0].type, "/circle.cctp.v1.MsgDepositForBurnWithCaller");
-    assert.equal(tx.messages[0].value.mint_recipient, mint);
-    assert.equal(tx.messages[0].value.amount, "980000");
-    assert.equal(tx.messages[1].value.amount[0].denom, "uusdc");
+describe("orbiter memo", () => {
+  it("burns to Avalanche with a zero caller and no fee action", () => {
+    const memo = JSON.parse(orbiterMemo(mint));
+    assert.equal("pre_actions" in memo.orbiter, false);
+    const forwarding = memo.orbiter.forwarding;
+    assert.equal(forwarding.protocol_id, "PROTOCOL_CCTP");
+    assert.equal(forwarding.passthrough_payload, "");
+    assert.equal(forwarding.attributes["@type"], "/noble.orbiter.controller.forwarding.v1.CCTPAttributes");
+    assert.equal(forwarding.attributes.destination_domain, AVALANCHE_DOMAIN);
+    assert.equal(forwarding.attributes.destination_domain === INJECTIVE_DOMAIN, false);
+    assert.equal("destination_caller" in forwarding.attributes, false);
+    assert.equal(forwarding.attributes.mint_recipient.length > 0, true);
+    assert.throws(() => orbiterMemo("not-an-address"), /mint recipient/);
   });
 
-  it("refuses a swap, an unknown message, and a second signature", () => {
-    assert.throws(() => assertCircleRoute(route({ does_swap: true })), /route swaps/);
-    assert.throws(() => assertCircleRoute(route({ swap_venues: [{ name: "osmosis" }] })), /route swaps/);
-    assert.throws(
-      () => assertCircleRoute(route({ operations: [{ swap: { pool: "1" } }] })),
-      /not a Circle burn/,
+  it("signs one Noble burn and leaves the gas fee", () => {
+    const message = nobleBurnMessage("noble1user", "960000", mint);
+    assert.equal(message.type, "/circle.cctp.v1.MsgDepositForBurn");
+    assert.equal(message.value.destination_domain, AVALANCHE_DOMAIN);
+    assert.equal("destination_caller" in message.value, false);
+    const encoded = encodeMessage(message);
+    const text = new TextDecoder().decode(encoded.value);
+    assert.equal(text.includes("noble1user"), true);
+    assert.equal(text.includes("960000"), true);
+    assert.equal(text.includes("uusdc"), true);
+    assert.throws(() => nobleBurnMessage("osmo1user", "1", mint), /not signed by the Noble account/);
+  });
+
+  it("names each self-relayed leg and does not send it", () => {
+    const legs = selfRelayLegs(mint, "1000000");
+    assert.equal(legs.length, 6);
+    assert.equal(legs[0].detail.receiver, ORBITER);
+    assert.equal(legs[0].detail.source_channel, "channel-750");
+    assert.equal(legs[0].detail.token.denom, OSMOSIS_USDC_DENOM);
+    assert.equal(JSON.stringify(legs[0].detail).includes("pre_actions"), false);
+    assert.equal(legs[3].detail.to, AVALANCHE_MESSAGE_TRANSMITTER_V1);
+    assert.equal(legs[4].detail.to, AVALANCHE_TOKEN_MESSENGER_V2);
+    assert.equal(legs[4].detail.destinationDomain, INJECTIVE_DOMAIN);
+    assert.equal(legs[4].detail.destinationCaller, bytesToBase64(zeroBytes32()));
+    assert.equal(legs[4].detail.maxFee, "0");
+    assert.equal(legs[4].detail.minFinalityThreshold, 2000);
+    assert.equal(legs[5].detail.to, INJECTIVE_MESSAGE_TRANSMITTER_V2);
+    const flat = JSON.stringify(legs);
+    assert.equal(flat.includes("api.skip.build"), false);
+    assert.equal(flat.includes("1776"), false);
+    assert.equal(flat.includes("ACTION_FEE"), false);
+  });
+
+  it("reads an Iris attestation and refuses one that is not ready", async () => {
+    const message = Uint8Array.of(0xab, 0xcd);
+    const hash = cctpMessageHash(message);
+    assert.equal(irisAttestationUrl(hash), `https://iris-api.circle.com/v1/attestations/${hash}`);
+    const ready = await readIris(async () => ({
+      ok: true,
+      json: async () => ({ status: "complete", attestation: "0x02" }),
+    }), message);
+    assert.equal(ready.message, "0xabcd");
+    assert.equal(ready.attestation, "0x02");
+    await assert.rejects(
+      () => readIris(async () => ({ ok: false, json: async () => ({}) }), message),
+      /not attested/,
     );
-    assert.throws(() => assertCircleRoute(route({ txs_required: 2 })), /more than one signature/);
-    assert.throws(
-      () => assertCircleRoute(route({
-        operations: [
-          { cctp_transfer: { from_chain_id: "noble-1", burn_token: "uusdc" } },
-          { cctp_transfer_v2: { to_chain_id: "1776", denom_out: "0xother" } },
-        ],
-      })),
-      /does not issue USDC/,
+    await assert.rejects(
+      () => readIris(async () => ({
+        ok: true,
+        json: async () => ({ status: "pending_confirmations", attestation: "PENDING" }),
+      }), message),
+      /not attested/,
     );
-    const osmosis = route({
-      operations: [
-        {
-          transfer: {
-            from_chain_id: "osmosis-1",
-            to_chain_id: "noble-1",
-            channel: "channel-750",
-            denom_in: OSMOSIS_USDC_DENOM,
-            denom_out: "uusdc",
-          },
-        },
-        ...route().operations,
-      ],
-    });
-    assert.equal(assertOsmosisCircleRoute(osmosis).txs_required, 1);
-    const memo = JSON.stringify({
-      orbiter: { forwarding: { protocol_id: "PROTOCOL_CCTP", attributes: { destination_domain: 1 } } },
-    });
-    const transfer = {
-      txs: [{
-        cosmos_tx: {
-          chain_id: "osmosis-1",
-          signer_address: "osmo1user",
-          msgs: [{
-            msg_type_url: "/ibc.applications.transfer.v1.MsgTransfer",
-            msg: JSON.stringify({
-              source_channel: "channel-750",
-              token: { denom: OSMOSIS_USDC_DENOM, amount: "1000000" },
-              sender: "osmo1user",
-              receiver: ORBITER,
-              memo,
-            }),
-          }],
-        },
-      }],
-    };
-    assert.equal(osmosisTransfer(transfer, "osmo1user", "1000000").value.receiver, ORBITER);
-    transfer.txs[0].cosmos_tx.msgs[0].msg = JSON.stringify({
-      source_channel: "channel-750",
-      token: { denom: OSMOSIS_USDC_DENOM, amount: "1000000" },
-      sender: "osmo1user",
-      receiver: "noble1user",
-      memo,
-    });
-    assert.throws(() => osmosisTransfer(transfer, "osmo1user", "1000000"), /does not burn on arrival/);
-    const unknown = body("/cosmos.bank.v1beta1.MsgMultiSend");
-    assert.throws(() => circleMessages(unknown), /will not sign/);
-    const paid = body();
-    paid.txs[0].cosmos_tx.msgs[1].msg = JSON.stringify({
-      from_address: signer,
-      to_address: signer,
-      amount: [{ denom: "uosmo", amount: "1" }],
-    });
-    assert.throws(() => circleMessages(paid), /burn fee is not USDC/);
-    assert.throws(() => circleMessages({ txs: [] }), /not one Noble transaction/);
   });
 });

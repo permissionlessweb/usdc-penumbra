@@ -10,52 +10,31 @@ USDC that is already on Osmosis or Noble keeps the existing path. A Penumbra sli
 
 ## Action A, the fee
 
-The ephemeral Injective account starts with no INJ. The page quotes an Osmosis exact-out for the full Injective deposit fee (`fee("injective-1", GAS.deposit)`, 64000000000000 inj). The quote is `GET https://sqs.osmosis.zone/router/quote` with `tokenOut` set to that fee and `tokenInDenom` set to Osmosis USDC. The quoted output denom must be Osmosis INJ (`ibc/64BA6E31FE887D66C6F8F31C7B1A80C7CA179239677B4088BB55F5EA07DBE273`) and the output amount must be the fee. The pool id and the USDC input are not pinned. SQS lists the pools from the output token back toward USDC. The page reverses that list, then requires the first pool to take Osmosis USDC. A quote may be more than one pool. A live leave stopped on this check: SQS had quoted the fee, and the page rejected the quote because the first listed pool was not USDC. Nothing was broadcast.
+The ephemeral account starts with no INJ and no AVAX. The page quotes two Osmosis exact-outs. One is the full Injective deposit fee (`fee("injective-1", GAS.deposit)`, 64000000000000 inj). The other is five times `RELAY_GAS` at the live Avalanche gas price, plus the live Axelar fee. Each quote is `GET https://sqs.osmosis.zone/router/quote` with `tokenOut` set to that amount and `tokenInDenom` set to Osmosis USDC. The pool id and the USDC input are not pinned. SQS lists the pools from the output token back toward USDC. The page reverses that list, then requires the first pool to take Osmosis USDC. A denom Osmosis already holds for the full amount is not quoted. That amount is bridged later.
 
-Action A withdraws that quoted USDC input. Penumbra sends it to Noble. The packet receiver is the string `pfm`, not a Noble account. The memo is packet-forward middleware:
+Action A withdraws the sum of those inputs, plus a USDC fee when the Osmosis account cannot pay the bundle in `uosmo`. The fee is the spot conversion of `600000` gas per swap or bridge message. Penumbra sends it to Noble. The packet receiver is the string `pfm`. The memo forwards on Noble channel-1 to the connected `osmo1` account. There is no wasm swap in that memo.
 
 ```json
 {
   "forward": {
-    "receiver": "osmo1uwk8xc6q0s6t5qcpr6rht3sczu6du83xq8pwxjua0hfj5hzcnh3sqxwvxs",
+    "receiver": "<connected osmo1 account>",
     "port": "transfer",
     "channel": "channel-1",
     "timeout": "10m",
-    "retries": 2,
-    "next": {
-      "wasm": {
-        "contract": "osmo1uwk8xc6q0s6t5qcpr6rht3sczu6du83xq8pwxjua0hfj5hzcnh3sqxwvxs",
-        "msg": {
-          "osmosis_swap": {
-            "output_denom": "ibc/64BA6E31FE887D66C6F8F31C7B1A80C7CA179239677B4088BB55F5EA07DBE273",
-            "slippage": { "min_output_amount": "<deposit fee, inj base units>" },
-            "receiver": "<ephemeral inj bech32>",
-            "on_failed_delivery": "do_nothing"
-          }
-        }
-      }
-    }
+    "retries": 2
   }
 }
 ```
 
-`channel-1` is Noble's channel to Osmosis. The forward receiver is the Osmosis contract, because Osmosis runs the wasm hook when the incoming packet's receiver is that contract. The contract is CrossChainSwaps v1.2, code id 37, label read from `lcd.osmosis.zone` on 2026-11-01. It sells the whole coin and emits one IBC transfer. The message is the v1 shape: `output_denom`, `slippage`, `receiver`, `on_failed_delivery`. It does not set v2 `route` or `final_memo`. The page uses the quote for the USDC amount and to confirm the output is the fee. The contract sells through the route stored on its swap router, not the pools in the page quote. That stored route was not read.
-
-`min_output_amount` is the deposit fee. The contract cannot exact-out and it does not partial-fill. A price move that would deliver less than the fee fails the swap, and the packet should refund to the Penumbra return address rather than leave USDC.inj beside too little INJ.
-
-The contract's channel registry is `(bech32 prefix, channel id)` set by the governor. The page does not put a channel in the swap message. The `inj` prefix on this instance was not confirmed. A missing prefix fails the wasm execute. The expected result is an IBC refund to the Penumbra return address. That registry was not checked live.
-
-Noble's packet receiver is the placeholder `pfm` so a missing middleware does not credit a user account. If Noble rejects that receiver, the packet refunds. The first signed attempt never reached Noble: the planner rejected it for a missing timeout height.
+When that USDC is on Osmosis, the page signs one Osmosis transaction: the exact-out swaps that are still needed, a channel-122 transfer of the deposit fee in INJ to the new account, and a channel-208 transfer of the AVAX budget to the Axelar GMP account. Axelar relays the AVAX. Each message uses a 600000 gas limit. The page waits until the new account's `inj` covers the deposit fee. It does not wait for AVAX in that transaction.
 
 ## Action B, the burn
 
-Action B is the rest of the slice, after action A and after a Penumbra fee reserve. The receiver is the Noble Orbiter module account `noble15xt7kx5mles58vkkfxvf0lq78sw04jajvfgd4d`. The memo is the Skip memo the page already accepts for an Osmosis to Injective route, unchanged.
+Action B is the rest of the slice, after action A and after a Penumbra fee reserve. The receiver is the Noble Orbiter module account `noble15xt7kx5mles58vkkfxvf0lq78sw04jajvfgd4d`. The memo is built on this page. It is `orbiter.forwarding` with `PROTOCOL_CCTP`, destination domain 1, the slice's Ethereum address as `mint_recipient`, and no `destination_caller`. There is no fee pre-action. [docs/self-relay.md](self-relay.md) is each later leg: who relays it, and what the user signs. The page preflights and submits the Avalanche mint once Circle has attested the Noble burn. It waits for USDC.inj and does not send the Injective `receiveMessage`.
 
-Skip is asked for that remainder with `allow_swaps: false`, `allow_multi_tx: true`, and `smart_relay: true`. The source chain in the request is `osmosis-1`, because a Noble-source quote returns burn messages and no memo. The connected Keplr Osmosis address is the signer Skip requires. The page does not sign or broadcast that Osmosis `MsgTransfer`. It checks the message the same way as the inbound Osmosis return: one Osmosis transfer, receiver Orbiter, amount equal to the remainder, memo protocol `PROTOCOL_CCTP`, destination domain 1. The memo string from that message is copied onto the withdrawal.
+The page does not ask a solver for a route or a message. Noble burns when the packet arrives, so the Noble account does not sign this withdrawal and does not pay a burn fee.
 
-The address list is the Osmosis account, a Noble account (the connected Noble address, or Orbiter when Noble is not connected), the ephemeral account's Ethereum address, and the ephemeral `inj` address. The Ethereum address is the CCTP mint recipient. The relay fee is amount-specific, so the quote is fetched for this remainder.
-
-Circle then burns on Noble, mints on Avalanche, and the same Avalanche transaction releases USDC.inj to the ephemeral account. The bank denom is `erc20:0xa00C59fF5a080D2b954d0c75e46E22a0c371235a`.
+Circle burns on Noble toward Avalanche. The mint lands at the slice's Ethereum address after `receiveMessage`. A later burn from that address toward Injective, and a second `receiveMessage`, releases USDC.inj. The bank denom is `erc20:0xa00C59fF5a080D2b954d0c75e46E22a0c371235a`. The same Avalanche transaction does not release USDC.inj.
 
 ## Deposit
 
@@ -75,10 +54,10 @@ A slice that cannot cover the quoted USDC input plus that reserve stops with "Th
 
 `issue("injective")` returns the `inj` bech32 address and the Ethereum address of the same key. One key per slice. The walk does not import custody. The page passes `issueHop`, `signHop`, and `wipeKey`.
 
-The key is wiped when a step fails before the first Penumbra broadcast, and after the deposit is acknowledged. After the fee withdrawal is broadcast, a failed migration keeps the key for this page session. The page does not send that fee withdrawal again. The error names the public `inj` address. Restart reads balances again and does not send those funds a second time. It also does not resume the deposit. Reloading the page drops the in-memory key.
+The key is wiped when a step fails before the first Penumbra broadcast, and after the deposit is acknowledged. After the fee withdrawal is broadcast, a failed migration keeps the key. The page does not send that fee withdrawal again. The error names the public `inj` address. A new hop is stored in local storage. Restart reads balances again and does not send the Penumbra exit a second time. When that stored account still holds USDC.inj, Deposit to Penumbra sends the balance it holds. A closed Zafu connection is asked again. The key stays until Zafu's USDC.inj increases.
 
-The user's Keplr accounts still sign the Osmosis and Noble steps for USDC that did not start in Penumbra. A Penumbra-only selection does not buy INJ on the user's Osmosis account and does not run the shared burn or the shared deposit.
+The user's Keplr account signs the Osmosis bundle after the fee slice lands. A Penumbra slice relays its own Noble burn: the page finds that burn by the hop's mint recipient, asks Circle, and the hop signs the Avalanche mint once its AVAX balance covers the gas. The same hop then approves USDC and burns it toward Injective. USDC that did not start in Penumbra still uses the shared Osmosis and Noble steps, on a new hop.
 
 ## What this does not change
 
-Osmosis USDC still returns on channel-750 with Skip's Orbiter memo, and Noble does not sign that burn. USDC already on Noble still burns in its own transaction. The user's Injective fee shortfall, when the USDC is already outside Penumbra, is still the exact-out hop on the user's Osmosis account. The mixnet stays closed.
+Osmosis USDC still returns on channel-750. The memo is the same client-built Orbiter burn, and Noble does not sign that burn. USDC already on Noble still burns in its own `MsgDepositForBurn`, with no caller and no extra fee send. The user's Injective fee shortfall, when the USDC is already outside Penumbra, is still the exact-out hop on the user's Osmosis account. The mixnet stays closed. The page does not call Skip.

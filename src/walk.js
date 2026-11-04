@@ -4,8 +4,8 @@
 
 import {
   FORWARD_RECEIVER,
+  osmosisUsdcMemo,
   feeAmount,
-  feeSwapMemo,
   matchUsdcPrice,
   migrationMemo,
   penumbraForwardMemo,
@@ -13,13 +13,39 @@ import {
 } from "./batch.js";
 import { LCD, formatUnits, readDenom } from "./balances.js";
 import {
+  AXELAR_GMP_ACCOUNT,
+  OSMOSIS_TO_AXELAR,
+  avaxBudget,
+  axelarNativeMemo,
+  estimateUrl,
+} from "./axelar.js";
+import {
+  AVALANCHE_TOKEN_MESSENGER_V2,
+  AVALANCHE_USDC,
   ORBITER,
-  assertCircleRoute,
-  assertOsmosisCircleRoute,
-  circleMessages,
-  osmosisTransfer,
-  uusdcDebit,
+  bytesToBase64,
+  ethereumBytes32,
+  nobleBurnMessage,
+  orbiterMemo,
+  readIris,
 } from "./circle.js";
+import {
+  AVALANCHE_MESSAGE_TRANSMITTER_V1,
+  AVALANCHE_RPC,
+  AVAX_GAS_MULTIPLE,
+  RELAY_GAS,
+  allowanceCalldata,
+  approveCalldata,
+  balanceOfCalldata,
+  bytesToHex,
+  depositForBurnCalldata,
+  ethCall,
+  relayBudget,
+  hexToBytes,
+  preflightReceiveMessage,
+  sendContract,
+} from "./evm.js";
+import { USDC_FEE_BUFFER, feeTokenAmount, preferredFeeDenom, readSpot } from "./fees.js";
 import { currentStep, initRun, keysNeeded, reduce, stepState } from "./machine.js";
 import {
   INJ_ON_OSMOSIS,
@@ -30,6 +56,7 @@ import {
   OSMOSIS_TO_NOBLE,
   OSMOSIS_USDC_DENOM,
   USDC_NOBLE_DENOM,
+  WAVAX_ON_OSMOSIS,
   describeStep,
   migrateAmount,
   pileRole,
@@ -40,7 +67,6 @@ import { nobleForwardChannel, nobleWithdrawalHeight } from "./zafu.js";
 const IBC_TIMEOUT_MS = 6 * 60 * 1000;
 const CCTP_TIMEOUT_MS = 8 * 60 * 1000;
 const POLL_MS = 4000;
-const SKIP = "https://api.skip.build";
 const SQS = "https://sqs.osmosis.zone";
 const RETURN_CHANNEL = /^transfer\/(channel-\d+)\/uusdc$/;
 
@@ -110,20 +136,27 @@ function chainPlace(chainId) {
   return chainId;
 }
 
-async function sign(io, { chainId, signer, messages, gas }) {
-  return signAndBroadcast({
+async function sign(io, { chainId, signer, messages, gas, feeAmount, onSubmitted }) {
+  const sent = await signAndBroadcast({
     keplr: io.keplr,
     fetchImpl: io.fetch,
     chainId,
     signer,
     messages,
-    feeAmount: fee(chainId, gas),
+    feeAmount: feeAmount || fee(chainId, gas),
     lcd: LCD[chainId],
     wait: clock(io, io.txTimeoutMs ?? 90_000),
     onSubmitted(hash) {
+      onSubmitted?.(hash);
       io.onProgress?.(`Submitted ${hash}. Waiting for ${chainPlace(chainId)}.`);
     },
   });
+  try {
+    await io.onAccount?.();
+  } catch {
+    // A balance refresh is not the transfer.
+  }
+  return sent;
 }
 
 function transfer(sender, channel, denom, amount, receiver, nowMs, memo = "") {
@@ -152,9 +185,13 @@ async function requireFee(io, chainId, address, gas, emptyMessage) {
   if (held < BigInt(priced.amount)) throw new Error(emptyMessage);
 }
 
-export function routesFromExactOut(quote) {
+export function routesFromExactOut(quote, outDenom = INJ_ON_OSMOSIS) {
+  const label = outDenom === WAVAX_ON_OSMOSIS ? "AVAX" : "INJ";
+  const reject = () => {
+    throw new Error(label === "AVAX" ? "Osmosis did not quote the AVAX swap." : "Osmosis did not quote the INJ swap.");
+  };
   const groups = Array.isArray(quote?.route) ? quote.route : [];
-  if (groups.length !== 1) throw new Error("Osmosis did not quote the INJ swap.");
+  if (groups.length !== 1) reject();
   const routes = [];
   // SQS lists an exact-out route from the output token back to the input.
   // The chain executes those pools from the input toward the output.
@@ -168,29 +205,103 @@ export function routesFromExactOut(quote) {
   const amountIn = String(rawIn?.amount ?? rawIn ?? "");
   const out = quote?.amount_out;
   const outAmount = String(out?.amount ?? "");
-  if (!routes.length || !/^\d+$/.test(amountIn) || !/^\d+$/.test(outAmount)) {
-    throw new Error("Osmosis did not quote the INJ swap.");
+  if (!routes.length || !/^\d+$/.test(amountIn) || !/^\d+$/.test(outAmount)) reject();
+  if (BigInt(amountIn) <= 0n || BigInt(outAmount) <= 0n) reject();
+  if (out?.denom !== outDenom) {
+    throw new Error(label === "AVAX" ? "The quote does not pay AVAX." : "The quote does not pay INJ.");
   }
-  if (BigInt(amountIn) <= 0n || BigInt(outAmount) <= 0n) {
-    throw new Error("Osmosis did not quote the INJ swap.");
-  }
-  if (out?.denom !== INJ_ON_OSMOSIS) throw new Error("The quote does not pay INJ.");
-  if (routes[0].token_in_denom !== OSMOSIS_USDC_DENOM) {
-    throw new Error("Osmosis did not quote the INJ swap.");
-  }
+  if (routes[0].token_in_denom !== OSMOSIS_USDC_DENOM) reject();
   return { routes, amountIn, amountOut: outAmount };
 }
 
-async function quoteFee(io, shortfall) {
-  const asked = shortfall.toString();
-  if (io.quote) return routesFromExactOut(await io.quote(asked));
+async function quoteExactOut(io, amount, outDenom) {
+  const asked = amount.toString();
+  if (io.quote) return routesFromExactOut(await io.quote(asked, outDenom), outDenom);
   const url = new URL(`${SQS}/router/quote`);
-  url.searchParams.set("tokenOut", `${asked}${INJ_ON_OSMOSIS}`);
+  url.searchParams.set("tokenOut", `${asked}${outDenom}`);
   url.searchParams.set("tokenInDenom", OSMOSIS_USDC_DENOM);
   url.searchParams.set("singleRoute", "true");
   const response = await io.fetch(url);
-  if (!response.ok) throw new Error(`The INJ quote failed (${response.status}).`);
-  return routesFromExactOut(await response.json());
+  if (!response.ok) {
+    const label = outDenom === WAVAX_ON_OSMOSIS ? "AVAX" : "INJ";
+    throw new Error(`The ${label} quote failed (${response.status}).`);
+  }
+  return routesFromExactOut(await response.json(), outDenom);
+}
+
+async function quoteFee(io, shortfall) {
+  return quoteExactOut(io, shortfall, INJ_ON_OSMOSIS);
+}
+
+function mintRecipientOf(ctx) {
+  if (ctx.depositHop?.ethereum) return ctx.depositHop.ethereum;
+  return addressOf(ctx, "avalanche");
+}
+
+function depositAccount(ctx) {
+  return ctx.depositHop?.address || ctx.addresses?.userInj || "";
+}
+
+async function listedBalances(io, sender) {
+  const fallback = async () => [
+    { denom: OSMOSIS_USDC_DENOM, amount: (await bank(io, "osmosis-1", sender, OSMOSIS_USDC_DENOM)).toString() },
+    { denom: "uosmo", amount: (await bank(io, "osmosis-1", sender, "uosmo")).toString() },
+  ];
+  try {
+    const url = new URL(`${LCD["osmosis-1"]}/cosmos/bank/v1beta1/balances/${sender}`);
+    url.searchParams.set("pagination.limit", "1000");
+    const response = await io.fetch(url);
+    if (!response.ok) return fallback();
+    const body = await response.json();
+    if (!Array.isArray(body.balances)) return fallback();
+    return body.balances;
+  } catch {
+    return fallback();
+  }
+}
+
+async function osmosisFeeCoin(io, sender, gas) {
+  const base = fee("osmosis-1", gas);
+  const coins = await listedBalances(io, sender);
+  if (preferredFeeDenom(coins) === OSMOSIS_USDC_DENOM) {
+    try {
+      const spot = await readSpot(io.fetch, OSMOSIS_USDC_DENOM);
+      const amount = feeTokenAmount(base.amount, spot);
+      const held = coins.find((coin) => coin.denom === OSMOSIS_USDC_DENOM);
+      if (held && BigInt(held.amount) >= amount) {
+        return { denom: OSMOSIS_USDC_DENOM, amount: amount.toString(), gas: base.gas };
+      }
+    } catch {
+      // A missing spot price leaves the base denom as the fee.
+    }
+  }
+  const held = coins.find((coin) => coin.denom === "uosmo");
+  if (held && BigInt(held.amount) >= BigInt(base.amount)) return base;
+  throw new Error("Osmosis gas is short.");
+}
+
+function sendable(requested, held, priced, denom) {
+  const feePaid = priced?.denom === denom ? BigInt(priced.amount) : 0n;
+  // One cent stays. The priced USDC fee is taken from that cent.
+  let reserve = feePaid;
+  if (denom === OSMOSIS_USDC_DENOM && held > USDC_FEE_BUFFER && reserve < USDC_FEE_BUFFER) {
+    reserve = USDC_FEE_BUFFER;
+  }
+  if (held <= reserve) return 0n;
+  const room = held - reserve;
+  return requested < room ? requested : room;
+}
+
+function noteUsdcSpent(ctx, before, after, fromOsmosis, input) {
+  const spent = before > after ? before - after : 0n;
+  const selected = BigInt(ctx.amountOsmosis || "0");
+  if (fromOsmosis) {
+    const take = spent > selected ? selected : spent;
+    ctx.amountOsmosis = (selected - take).toString();
+  } else if (spent < input) {
+    ctx.amountOsmosis = (selected + (input - spent)).toString();
+  }
+  return spent;
 }
 
 function nobleBudget(ctx) {
@@ -232,74 +343,37 @@ async function fundFeeFromNoble(ctx, io, osmosis, input) {
   return after;
 }
 
-async function postJson(io, url, body) {
-  const response = await io.fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  let parsed = null;
-  try {
-    parsed = await response.json();
-  } catch {
-    throw new Error("Circle did not return a burn.");
-  }
-  if (!response.ok) throw new Error(parsed?.message || "Circle did not return a burn.");
-  return parsed;
-}
-
-async function circleQuote(io, amount, sourceDenom, sourceChain, addresses) {
-  const route = await postJson(io, `${SKIP}/v2/fungible/route`, {
-    amount_in: amount,
-    source_asset_denom: sourceDenom,
-    source_asset_chain_id: sourceChain,
-    dest_asset_denom: INJ_USDC_DENOM,
-    dest_asset_chain_id: "injective-1",
-    allow_multi_tx: true,
-    allow_swaps: false,
-    smart_relay: true,
-  });
-  const msgs = await postJson(io, `${SKIP}/v2/fungible/msgs`, {
-    source_asset_denom: route.source_asset_denom,
-    source_asset_chain_id: route.source_asset_chain_id,
-    dest_asset_denom: route.dest_asset_denom,
-    dest_asset_chain_id: route.dest_asset_chain_id,
-    amount_in: route.amount_in,
-    amount_out: route.amount_out,
-    address_list: addresses,
-    operations: route.operations,
-    slippage_tolerance_percent: "0",
-  });
-  return { route, msgs };
-}
-
 async function gatherOsmosis(ctx, io) {
   const amount = BigInt(ctx.amountOsmosis || "0");
   if (amount <= 0n) return "Osmosis USDC was used for the Injective fee.";
   const sender = ctx.addresses?.userOsmosis || "";
-  const noble = holderOf(ctx);
-  const avalanche = addressOf(ctx, "avalanche");
-  const inj = ctx.addresses?.userInj || "";
-  if (!sender || !noble || !avalanche || !inj) throw new Error("A required account is not connected.");
-  await requireFee(io, "osmosis-1", sender, GAS.hook, "Osmosis gas is short.");
-  const { route, msgs } = await circleQuote(io, amount.toString(), OSMOSIS_USDC_DENOM, "osmosis-1", [
+  const avalanche = mintRecipientOf(ctx);
+  const inj = depositAccount(ctx);
+  if (!sender || !avalanche || !inj) throw new Error("A required account is not connected.");
+  const priced = await osmosisFeeCoin(io, sender, GAS.hook);
+  const held = await bank(io, "osmosis-1", sender, OSMOSIS_USDC_DENOM);
+  const sendAmount = sendable(amount, held, priced, OSMOSIS_USDC_DENOM);
+  if (sendAmount <= 0n) throw new Error("Osmosis gas is short.");
+  const message = transfer(
     sender,
-    noble,
-    avalanche,
-    inj,
-  ]);
-  assertOsmosisCircleRoute(route);
-  if (route.amount_in !== amount.toString()) throw new Error("The transfer does not burn on arrival.");
-  const message = osmosisTransfer(msgs, sender, amount.toString());
+    OSMOSIS_TO_NOBLE,
+    OSMOSIS_USDC_DENOM,
+    sendAmount,
+    ORBITER,
+    io.now(),
+    orbiterMemo(avalanche),
+  );
   ctx.usdcInjBefore = (await bank(io, "injective-1", inj, INJ_USDC_DENOM)).toString();
   const sent = await sign(io, {
     chainId: "osmosis-1",
     signer: sender,
     gas: GAS.hook,
+    feeAmount: priced,
     messages: [message],
   });
   ctx.bridgedBurn = true;
   ctx.burnHash = sent.hash;
+  ctx.burnAmount = sendAmount.toString();
   return `The transfer carries the Noble burn. ${sent.hash}`;
 }
 
@@ -328,79 +402,187 @@ async function gatherExit(ctx, io) {
   return `The receipts joined the Noble account. ${sent.hash}`;
 }
 
-async function gasOsmosis(ctx, io) {
-  const osmosis = ctx.addresses?.userOsmosis || "";
-  const inj = ctx.addresses?.userInj || "";
-  if (!osmosis || !inj) throw new Error("A required account is not connected.");
+function exactOutSwap(sender, quote, outDenom) {
+  return {
+    type: "/osmosis.poolmanager.v1beta1.MsgSwapExactAmountOut",
+    value: {
+      sender,
+      routes: quote.routes,
+      token_in_max_amount: quote.amountIn,
+      token_out: { denom: outDenom, amount: quote.amountOut },
+    },
+  };
+}
+
+async function rpcQuantity(io, url, method) {
+  const response = await io.fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: [] }),
+  });
+  if (!response.ok) throw new Error("Avalanche gas price was not read.");
+  const body = await response.json();
+  const result = body?.result;
+  if (typeof result !== "string" || !/^0x[0-9a-fA-F]+$/.test(result)) {
+    throw new Error("Avalanche gas price was not read.");
+  }
+  return BigInt(result);
+}
+
+async function axelarFee(io) {
+  const response = await io.fetch(estimateUrl());
+  if (!response.ok) throw new Error("Axelar did not price the Avalanche relay.");
+  const text = String(await response.text()).trim().replace(/^"|"$/g, "");
+  if (!/^\d+$/.test(text) || BigInt(text) <= 0n) throw new Error("Axelar did not price the Avalanche relay.");
+  return text;
+}
+
+async function avaxTarget(io) {
+  const price = await rpcQuantity(io, "https://api.avax.network/ext/bc/C/rpc", "eth_gasPrice");
+  const relayFee = await axelarFee(io);
+  const out = avaxBudget(price, RELAY_GAS * AVAX_GAS_MULTIPLE, relayFee);
+  return { relayFee, out };
+}
+
+async function quotedAvax(io) {
+  const target = await avaxTarget(io);
+  const quote = await quoteExactOut(io, target.out, WAVAX_ON_OSMOSIS);
+  if (BigInt(quote.amountOut) !== target.out) throw new Error("Osmosis did not quote the AVAX swap.");
+  return { ...target, quote };
+}
+
+async function holdHop(ctx, io) {
+  if (!io.issueHop || !io.wipeKey) throw new Error("The page cannot hold the Injective key.");
+  const hop = await io.issueHop("injective");
+  if (!hop?.keyId || !String(hop.address || "").startsWith("inj1") || !hop.ethereum) {
+    if (hop?.keyId) await io.wipeKey(hop.keyId);
+    throw new Error("The page cannot hold the Injective key.");
+  }
+  ctx.depositHop = hop;
+  io.onHop?.({ address: hop.address, ethereum: hop.ethereum, inj: 0n, usdc: 0n, avax: null });
+  return hop;
+}
+
+async function injLeg(io, osmosis) {
   const needed = BigInt(fee("injective-1", GAS.deposit).amount);
-  const heldInj = await bank(io, "injective-1", inj, "inj");
-  if (heldInj >= needed) return "The Injective wallet can pay the fee.";
+  const held = await bank(io, "osmosis-1", osmosis, INJ_ON_OSMOSIS);
+  const injQuote = held >= needed ? null : await quoteFee(io, needed);
+  if (injQuote && BigInt(injQuote.amountOut) !== needed) throw new Error("Osmosis did not quote the INJ swap.");
+  return { needed, injQuote, injInput: injQuote ? BigInt(injQuote.amountIn) : 0n };
+}
 
-  const shortfall = needed - heldInj;
-  const priced = BigInt(fee("osmosis-1", GAS.swap).amount) + BigInt(fee("osmosis-1", GAS.ibc).amount);
-  if (await bank(io, "osmosis-1", osmosis, "uosmo") < priced) throw new Error("Osmosis gas is short.");
-  const quote = await quoteFee(io, shortfall);
-  if (BigInt(quote.amountOut) !== shortfall) throw new Error("Osmosis did not quote the INJ swap.");
-  const input = BigInt(quote.amountIn);
+async function avaxLeg(io, osmosis) {
+  const avax = await avaxTarget(io);
+  const held = await bank(io, "osmosis-1", osmosis, WAVAX_ON_OSMOSIS);
+  const avaxQuote = held >= avax.out ? null : await quoteExactOut(io, avax.out, WAVAX_ON_OSMOSIS);
+  if (avaxQuote && BigInt(avaxQuote.amountOut) !== avax.out) throw new Error("Osmosis did not quote the AVAX swap.");
+  return { avax, avaxQuote, avaxInput: avaxQuote ? BigInt(avaxQuote.amountIn) : 0n };
+}
 
+function legGas(legs) {
+  const messages = (legs.injQuote ? 1 : 0) + 1 + (legs.avaxQuote ? 1 : 0) + 1;
+  return GAS.ibc * messages;
+}
+
+// USDC the Penumbra slice must forward when Osmosis cannot pay this gas in uosmo.
+async function sliceGasUsdc(io, osmosis, gas) {
+  const base = fee("osmosis-1", gas);
+  const uosmo = await bank(io, "osmosis-1", osmosis, "uosmo");
+  if (uosmo >= BigInt(base.amount)) return 0n;
+  try {
+    const spot = await readSpot(io.fetch, OSMOSIS_USDC_DENOM);
+    return feeTokenAmount(base.amount, spot);
+  } catch {
+    throw new Error("Osmosis gas is short.");
+  }
+}
+
+// One Osmosis transaction. A denom already held is bridged and not swapped.
+// trackSelection is false when the USDC was forwarded from Penumbra.
+async function bridgeGas(ctx, io, hop, legs, trackSelection) {
+  const osmosis = ctx.addresses?.userOsmosis || "";
+  const { needed, injQuote, injInput, avax, avaxQuote, avaxInput } = legs;
+  let total = injInput + avaxInput;
+  const messages = [];
+  if (injQuote) messages.push(exactOutSwap(osmosis, injQuote, INJ_ON_OSMOSIS));
+  messages.push(transfer(
+    osmosis,
+    OSMOSIS_TO_INJECTIVE,
+    INJ_ON_OSMOSIS,
+    injQuote ? injQuote.amountOut : needed,
+    hop.address,
+    io.now(),
+  ));
+  if (avaxQuote) messages.push(exactOutSwap(osmosis, avaxQuote, WAVAX_ON_OSMOSIS));
+  messages.push(transfer(
+    osmosis,
+    OSMOSIS_TO_AXELAR,
+    WAVAX_ON_OSMOSIS,
+    avaxQuote ? avaxQuote.amountOut : avax.out,
+    AXELAR_GMP_ACCOUNT,
+    io.now(),
+    axelarNativeMemo(hop.ethereum, avax.relayFee),
+  ));
+  const buyGas = GAS.ibc * messages.length;
+  const swapFee = await osmosisFeeCoin(io, osmosis, buyGas);
+  if (swapFee.denom === OSMOSIS_USDC_DENOM) total += BigInt(swapFee.amount);
   const selected = BigInt(ctx.amountOsmosis || "0");
   const live = await bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM);
   const covered = selected < live ? selected : live;
-  const fromOsmosis = covered >= input;
+  // A Penumbra forward is not the selected Osmosis amount. The live balance pays it.
+  const fromOsmosis = (trackSelection ? covered : live) >= total;
   let usdcBefore = live;
-  if (!fromOsmosis) usdcBefore = await fundFeeFromNoble(ctx, io, osmosis, input);
-
-  const injBefore = await bank(io, "osmosis-1", osmosis, INJ_ON_OSMOSIS);
-  const swapped = await sign(io, {
-    chainId: "osmosis-1",
-    signer: osmosis,
-    gas: GAS.swap,
-    messages: [{
-      type: "/osmosis.poolmanager.v1beta1.MsgSwapExactAmountOut",
-      value: {
-        sender: osmosis,
-        routes: quote.routes,
-        token_in_max_amount: quote.amountIn,
-        token_out: { denom: INJ_ON_OSMOSIS, amount: quote.amountOut },
-      },
-    }],
-  });
-  const usdcAfter = await bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM);
-  const spent = usdcBefore > usdcAfter ? usdcBefore - usdcAfter : 0n;
-  const gained = (await bank(io, "osmosis-1", osmosis, INJ_ON_OSMOSIS)) - injBefore;
-  if (gained <= 0n) throw new Error(`The Osmosis balance did not increase. ${swapped.hash}`);
-  if (fromOsmosis) {
-    const take = spent > selected ? selected : spent;
-    ctx.amountOsmosis = (selected - take).toString();
-  } else if (spent < input) {
-    ctx.amountOsmosis = (selected + (input - spent)).toString();
+  if (!fromOsmosis && total > 0n) {
+    if (!trackSelection) throw new Error("Osmosis did not receive the fee slice.");
+    usdcBefore = await fundFeeFromNoble(ctx, io, osmosis, total);
   }
-
-  const bridged = await sign(io, {
+  const bought = await sign(io, {
     chainId: "osmosis-1",
     signer: osmosis,
-    gas: GAS.ibc,
-    messages: [transfer(osmosis, OSMOSIS_TO_INJECTIVE, INJ_ON_OSMOSIS, gained, inj, io.now())],
+    gas: buyGas,
+    feeAmount: swapFee,
+    onSubmitted() { ctx.hopBroadcast = true; },
+    messages,
   });
+  if (trackSelection) {
+    noteUsdcSpent(
+      ctx,
+      usdcBefore,
+      await bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM),
+      fromOsmosis,
+      injInput + avaxInput,
+    );
+  }
   const arrived = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, needed, () =>
-    bank(io, "injective-1", inj, "inj"),
+    bank(io, "injective-1", hop.address, "inj"),
   );
-  if (arrived == null) throw new Error(`The Injective balance did not increase. ${bridged.hash}`);
-  return `INJ arrived. ${bridged.hash}`;
+  if (arrived == null) throw new Error(`The Injective balance did not increase. ${bought.hash}`);
+  return `INJ arrived. Axelar relays the AVAX. ${bought.hash}`;
 }
 
-async function nobleBurnQuote(io, holder, avalanche, inj, amount) {
-  const { route, msgs } = await circleQuote(io, amount, USDC_NOBLE_DENOM, "noble-1", [holder, avalanche, inj]);
-  assertCircleRoute(route);
-  const tx = circleMessages(msgs);
-  if (tx.signer !== holder) throw new Error("The burn is not signed by the Noble account.");
-  return tx;
+async function gasOsmosis(ctx, io) {
+  const osmosis = ctx.addresses?.userOsmosis || "";
+  const userInj = ctx.addresses?.userInj || "";
+  if (!osmosis || !userInj) throw new Error("A required account is not connected.");
+  // Upper bound: two swaps and two bridges. A token already on Osmosis skips its swap.
+  await osmosisFeeCoin(io, osmosis, GAS.swap + GAS.swap + GAS.ibc + GAS.ibc);
+
+  const bought = await injLeg(io, osmosis);
+  const selected = BigInt(ctx.amountOsmosis || "0");
+  const live = await bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM);
+  const covered = selected < live ? selected : live;
+  if (bought.injInput > 0n && covered < bought.injInput && nobleBudget(ctx) < bought.injInput) {
+    throw new Error("The selected USDC cannot buy the Injective fee.");
+  }
+  const priced = await avaxLeg(io, osmosis);
+  const hop = await holdHop(ctx, io);
+  return bridgeGas(ctx, io, hop, { ...bought, ...priced }, true);
 }
 
 async function burnNoble(ctx, io) {
   const holder = holderOf(ctx);
-  const avalanche = addressOf(ctx, "avalanche");
-  const inj = ctx.addresses?.userInj || "";
+  const avalanche = mintRecipientOf(ctx);
+  const inj = depositAccount(ctx);
   if (!holder || !avalanche || !inj) throw new Error("A required account is not connected.");
   const findings = ctx.bridgedBurn ? { ...ctx.findings, osmosis: false } : ctx.findings;
   const planned = BigInt(migrateAmount(findings, ctx.amountOut, ctx.amountIn, ctx.amountOsmosis));
@@ -410,18 +592,8 @@ async function burnNoble(ctx, io) {
   const held = await bank(io, "noble-1", holder, USDC_NOBLE_DENOM);
   if (held <= gasFee) throw new Error("Noble needs USDC left for the fee.");
   const room = held - gasFee;
-  let ask = room < planned ? room : planned;
+  const ask = room < planned ? room : planned;
   if (ask <= 0n) throw new Error("Noble needs USDC left for the fee.");
-  let tx = await nobleBurnQuote(io, holder, avalanche, inj, ask.toString());
-  let debit = uusdcDebit(tx.messages, holder);
-  if (debit + gasFee > held) {
-    const next = held - gasFee - (debit - ask);
-    if (next <= 0n || next >= ask) throw new Error("Noble needs USDC left for the fee.");
-    ask = next;
-    tx = await nobleBurnQuote(io, holder, avalanche, inj, ask.toString());
-    debit = uusdcDebit(tx.messages, holder);
-    if (debit + gasFee > held) throw new Error("Noble needs USDC left for the fee.");
-  }
   if (ctx.usdcInjBefore == null) {
     ctx.usdcInjBefore = (await bank(io, "injective-1", inj, INJ_USDC_DENOM)).toString();
   }
@@ -429,74 +601,396 @@ async function burnNoble(ctx, io) {
     chainId: "noble-1",
     signer: holder,
     gas: GAS.burn,
-    messages: tx.messages,
+    messages: [nobleBurnMessage(holder, ask.toString(), avalanche)],
   });
   ctx.burnHash = sent.hash;
-  try {
-    await io.fetch(`${SKIP}/v2/tx/track`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tx_hash: sent.hash, chain_id: "noble-1" }),
-    });
-  } catch {
-    // Arrival is the Injective balance. A missed track is not a failed burn.
-  }
   return `Circle burned the USDC. ${sent.hash}`;
 }
 
+function decodeAttr(value) {
+  const text = String(value ?? "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text) || text.length % 4 !== 0 || text.length < 4) return text;
+  try {
+    const decoded = atob(text);
+    if (/^[\t\n\r\x20-\x7e]+$/.test(decoded)) return decoded;
+  } catch {
+    // The attribute was already plain text.
+  }
+  return text;
+}
+
+function txEvents(body) {
+  const tx = body?.tx_response || body?.txResponse || body;
+  return tx?.events || [];
+}
+
+async function packetSequence(io, hash) {
+  const response = await io.fetch(`${LCD["osmosis-1"]}/cosmos/tx/v1beta1/txs/${hash}`);
+  if (!response.ok) return "";
+  const body = await response.json();
+  for (const event of txEvents(body)) {
+    if (event.type !== "send_packet") continue;
+    const attrs = {};
+    for (const attr of event.attributes || []) attrs[decodeAttr(attr.key)] = decodeAttr(attr.value);
+    if (attrs.packet_src_channel === OSMOSIS_TO_NOBLE && /^\d+$/.test(attrs.packet_sequence || "")) {
+      return attrs.packet_sequence;
+    }
+  }
+  return "";
+}
+
+async function nobleRecvHash(io, sequence) {
+  const url = new URL(`${LCD["noble-1"]}/cosmos/tx/v1beta1/txs`);
+  url.searchParams.set("query", `recv_packet.packet_dst_channel='${NOBLE_TO_OSMOSIS}' AND recv_packet.packet_sequence='${sequence}'`);
+  url.searchParams.set("limit", "1");
+  const response = await io.fetch(url);
+  if (!response.ok) return "";
+  const body = await response.json();
+  const txs = body.tx_responses || body.txResponses || [];
+  const hash = String(txs[0]?.txhash || txs[0]?.tx_hash || "");
+  return /^(0x)?[0-9a-fA-F]{64}$/.test(hash) ? hash : "";
+}
+
+function messageSent(body) {
+  for (const event of txEvents(body)) {
+    if (event.type !== "circle.cctp.v1.MessageSent") continue;
+    for (const attr of event.attributes || []) {
+      if (decodeAttr(attr.key) !== "message") continue;
+      let value = String(attr.value || "").trim();
+      if (value.startsWith('"')) {
+        try { value = JSON.parse(value); } catch { /* The value was already plain. */ }
+      }
+      if (typeof value !== "string") continue;
+      if (/^0x(?:[0-9a-fA-F]{2})+$/.test(value)) return hexToBytes(value);
+      try {
+        const raw = atob(value);
+        const out = new Uint8Array(raw.length);
+        for (let index = 0; index < raw.length; index += 1) out[index] = raw.charCodeAt(index);
+        if (out.length) return out;
+      } catch {
+        // The attribute was not the message bytes.
+      }
+    }
+  }
+  return null;
+}
+
+function ackError(body) {
+  for (const event of txEvents(body)) {
+    if (event.type !== "write_acknowledgement") continue;
+    const attrs = {};
+    for (const attr of event.attributes || []) attrs[decodeAttr(attr.key)] = decodeAttr(attr.value);
+    const ack = attrs.packet_ack || "";
+    if (!ack.includes("error")) continue;
+    try {
+      const parsed = JSON.parse(ack);
+      if (parsed.error) return String(parsed.error);
+    } catch {
+      return ack;
+    }
+  }
+  return "";
+}
+
+async function rememberNobleBurn(ctx, io, hash) {
+  const response = await io.fetch(`${LCD["noble-1"]}/cosmos/tx/v1beta1/txs/${hash}`);
+  if (response.ok) {
+    const body = await response.json();
+    const reason = ackError(body);
+    if (reason) throw new Error(`Noble did not burn the USDC. ${reason}`);
+    const message = messageSent(body);
+    if (message) ctx.cctpMessage = message;
+  }
+  ctx.nobleBurnHash = hash;
+}
+
+// The Penumbra migration burns on Noble receive. The mint recipient is this hop.
+async function nobleBurnByMintRecipient(io, ethereum) {
+  const recipient = bytesToBase64(ethereumBytes32(ethereum));
+  const url = new URL(`${LCD["noble-1"]}/cosmos/tx/v1beta1/txs`);
+  url.searchParams.set("query", `circle.cctp.v1.DepositForBurn.mint_recipient='${recipient}'`);
+  url.searchParams.set("limit", "1");
+  url.searchParams.set("order_by", "ORDER_BY_DESC");
+  const response = await io.fetch(url);
+  if (!response.ok) return "";
+  const body = await response.json();
+  const txs = body.tx_responses || body.txResponses || [];
+  const hash = String(txs[0]?.txhash || txs[0]?.tx_hash || "");
+  return /^(0x)?[0-9a-fA-F]{64}$/.test(hash) ? hash : "";
+}
+
+async function nobleBurnHash(ctx, io) {
+  if (ctx.nobleBurnHash) return ctx.nobleBurnHash;
+  if (ctx.burnLookup === "recipient") {
+    const ethereum = ctx.depositHop?.ethereum || "";
+    if (!ethereum) return "";
+    const hash = await nobleBurnByMintRecipient(io, ethereum);
+    if (!hash) return "";
+    await rememberNobleBurn(ctx, io, hash);
+    return ctx.nobleBurnHash;
+  }
+  if (!ctx.bridgedBurn) {
+    ctx.nobleBurnHash = ctx.burnHash || "";
+    return ctx.nobleBurnHash;
+  }
+  if (!ctx.burnHash) return "";
+  const sequence = await packetSequence(io, ctx.burnHash);
+  if (!sequence) return "";
+  const hash = await nobleRecvHash(io, sequence);
+  if (!hash) return "";
+  await rememberNobleBurn(ctx, io, hash);
+  return ctx.nobleBurnHash;
+}
+
+async function cctpMessage(ctx, io, hash) {
+  if (ctx.cctpMessage) return ctx.cctpMessage;
+  const response = await io.fetch(`${LCD["noble-1"]}/cosmos/tx/v1beta1/txs/${hash}`);
+  if (!response.ok) return null;
+  const message = messageSent(await response.json());
+  if (message) ctx.cctpMessage = message;
+  return message;
+}
+
+async function hopBalances(io, hop) {
+  if (!hop?.address) return null;
+  const inj = await bank(io, "injective-1", hop.address, "inj");
+  const usdc = await bank(io, "injective-1", hop.address, INJ_USDC_DENOM);
+  let avax = null;
+  if (hop.ethereum) {
+    try {
+      const response = await io.fetch(AVALANCHE_RPC, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [hop.ethereum, "latest"] }),
+      });
+      const body = await response.json();
+      if (typeof body?.result === "string" && /^0x[0-9a-fA-F]+$/.test(body.result)) avax = BigInt(body.result);
+    } catch {
+      avax = null;
+    }
+  }
+  return { address: hop.address, ethereum: hop.ethereum || "", inj, usdc, avax };
+}
+
+async function submitAvalanche(ctx, io, to, data) {
+  const hop = ctx.depositHop;
+  if (hop) {
+    if (!hop.ethereum || !hop.keyId || !io.signDigest) return null;
+    const balances = await hopBalances(io, hop);
+    if (!balances?.avax) return null;
+    return sendContract({
+      fetchImpl: io.fetch,
+      from: hop.ethereum,
+      to,
+      data,
+      signDigest: (digest) => io.signDigest(hop.keyId, digest),
+    });
+  }
+  const ethereum = io.ethereum;
+  if (!ethereum?.request) return null;
+  const accounts = await ethereum.request({ method: "eth_requestAccounts" });
+  const from = Array.isArray(accounts) ? accounts[0] : "";
+  if (!from) return null;
+  const hash = await ethereum.request({
+    method: "eth_sendTransaction",
+    params: [{ from, to, data, chainId: "0xa86a" }],
+  });
+  return hash ? { hash: String(hash) } : null;
+}
+
+async function mintedUsdc(io, account) {
+  const data = bytesToHex(balanceOfCalldata(account));
+  const result = await ethCall(io.fetch, AVALANCHE_USDC, data);
+  if (typeof result !== "string" || !/^0x[0-9a-fA-F]+$/.test(result)) return 0n;
+  return BigInt(result);
+}
+
+async function usdcAllowance(io, owner) {
+  const data = bytesToHex(allowanceCalldata(owner, AVALANCHE_TOKEN_MESSENGER_V2));
+  const result = await ethCall(io.fetch, AVALANCHE_USDC, data);
+  if (typeof result !== "string" || !/^0x[0-9a-fA-F]+$/.test(result)) return 0n;
+  return BigInt(result);
+}
+
 async function issueInj(ctx, io) {
-  const inj = ctx.addresses?.userInj || "";
+  const inj = depositAccount(ctx);
   if (!inj) throw new Error("A required account is not connected.");
   const before = BigInt(ctx.usdcInjBefore ?? "0");
-  const after = await untilAtLeast(io, io.cctpTimeoutMs ?? CCTP_TIMEOUT_MS, before + 1n, () =>
-    bank(io, "injective-1", inj, INJ_USDC_DENOM),
-  );
-  if (after == null) {
-    const hash = ctx.burnHash ? ` The Noble burn was ${ctx.burnHash}.` : "";
-    throw new Error(`The Injective balance did not increase.${hash}`);
+  const timeout = io.cctpTimeoutMs ?? CCTP_TIMEOUT_MS;
+  const start = io.now();
+  let attempt = 0;
+  while (io.now() - start <= timeout) {
+    attempt += 1;
+    const held = await bank(io, "injective-1", inj, INJ_USDC_DENOM);
+    const hop = await hopBalances(io, ctx.depositHop);
+    if (hop) io.onHop?.(hop);
+    if (held >= before + 1n) {
+      ctx.arrivedInj = (held - before).toString();
+      return "USDC.inj arrived.";
+    }
+    const hash = await nobleBurnHash(ctx, io);
+    const hopText = hop
+      ? ` INJ ${formatUnits(hop.inj, 18)}. AVAX ${hop.avax == null ? "not read" : formatUnits(hop.avax, 18)}. USDC.inj ${formatUnits(hop.usdc, 6)}.`
+      : "";
+    const message = hash ? await cctpMessage(ctx, io, hash) : null;
+    if (!hash || !message) {
+      io.onProgress?.(`Checking the mint, attempt ${attempt}. Waiting for the Noble burn.${hopText}`);
+    } else {
+      try {
+        const attested = await readIris(io.fetch, message);
+        ctx.attestation = attested;
+        if (!ctx.avalancheMintSent) {
+          try {
+            const preflight = await preflightReceiveMessage(io.fetch, attested);
+            const sent = await submitAvalanche(ctx, io, preflight.to || AVALANCHE_MESSAGE_TRANSMITTER_V1, preflight.data);
+            if (sent) {
+              ctx.avalancheMintSent = true;
+              io.onProgress?.(`Submitted the Avalanche mint. ${sent.hash}`);
+            } else {
+              io.onProgress?.(`Waiting for AVAX on the ephemeral account.${hopText}`);
+            }
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            if (/nonce already used/i.test(reason)) {
+              ctx.avalancheMintSent = true;
+              io.onProgress?.(`The Avalanche mint is already in.${hopText}`);
+            } else {
+              io.onProgress?.(`Checking the mint, attempt ${attempt}. ${reason}`);
+            }
+          }
+        }
+        if (ctx.avalancheMintSent && !ctx.avalancheBurnSent) {
+          try {
+            const recipient = mintRecipientOf(ctx);
+            const minted = await mintedUsdc(io, recipient);
+            if (minted <= 0n) {
+              io.onProgress?.(`Waiting for the minted USDC on the ephemeral account.${hopText}`);
+            } else {
+              const allowance = await usdcAllowance(io, recipient);
+              const burnData = bytesToHex(depositForBurnCalldata({
+                amount: minted,
+                mintRecipient: recipient,
+              }));
+              const approveData = bytesToHex(approveCalldata(AVALANCHE_TOKEN_MESSENGER_V2, minted));
+              const funded = hop?.avax;
+              const calls = allowance < minted
+                ? [{ to: AVALANCHE_USDC, data: approveData }, { to: AVALANCHE_TOKEN_MESSENGER_V2, data: burnData }]
+                : [{ to: AVALANCHE_TOKEN_MESSENGER_V2, data: burnData }];
+              const budget = await relayBudget(io.fetch, recipient, calls);
+              if (funded != null && funded < budget.cost) {
+                io.onProgress?.(`Waiting for AVAX on the ephemeral account. The next steps need ${formatUnits(budget.cost, 18)} AVAX.${hopText}`);
+              } else if (allowance < minted) {
+                const approved = await submitAvalanche(ctx, io, AVALANCHE_USDC, approveData);
+                if (approved) io.onProgress?.(`Submitted the USDC approval. ${approved.hash}`);
+                else io.onProgress?.(`Waiting for AVAX on the ephemeral account.${hopText}`);
+              } else {
+                const burned = await submitAvalanche(ctx, io, AVALANCHE_TOKEN_MESSENGER_V2, burnData);
+                if (burned) {
+                  ctx.avalancheBurnSent = true;
+                  io.onProgress?.(`Submitted the burn toward Injective. ${burned.hash}`);
+                } else {
+                  io.onProgress?.(`Waiting for AVAX on the ephemeral account.${hopText}`);
+                }
+              }
+            }
+          } catch (error) {
+            io.onProgress?.(error instanceof Error ? error.message : String(error));
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        io.onProgress?.(
+          /not attested/.test(message)
+            ? `Checking Circle, attempt ${attempt}. Waiting for Circle to attest the Noble burn.${hopText}`
+            : message,
+        );
+      }
+    }
+    await io.sleep(io.intervalMs ?? POLL_MS);
   }
-  ctx.arrivedInj = (after - before).toString();
-  return "USDC.inj arrived.";
+  const shown = ctx.nobleBurnHash || (!ctx.bridgedBurn ? ctx.burnHash : "");
+  const named = shown ? ` The Noble burn was ${shown}.` : "";
+  throw new Error(`The Injective balance did not increase.${named}`);
+}
+
+function closedConnection(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /connection closed/i.test(message);
 }
 
 async function penumbraBalance(io) {
-  if (!io.penumbraUsdc) throw new Error("Zafu is not connected.");
-  const read = await io.penumbraUsdc();
-  return {
-    noble: BigInt(read.noble ?? read.amount ?? "0"),
-    inj: BigInt(read.inj ?? "0"),
-    decimals: Number(read.decimals ?? 6),
-  };
+  let last = new Error("Zafu is not connected.");
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      if (!io.penumbraUsdc) throw new Error("Zafu is not connected.");
+      const read = await io.penumbraUsdc();
+      return {
+        noble: BigInt(read.noble ?? read.amount ?? "0"),
+        inj: BigInt(read.inj ?? "0"),
+        decimals: Number(read.decimals ?? 6),
+      };
+    } catch (error) {
+      last = error;
+      if (!closedConnection(error) || attempt === 2) break;
+      io.onProgress?.("Zafu closed the connection. Asking again.");
+      try {
+        await io.reconnectZafu?.();
+      } catch {
+        // The next read reports the closed connection.
+      }
+      await io.sleep(io.intervalMs ?? POLL_MS);
+    }
+  }
+  throw last;
 }
 
 function penumbraText(amount, decimals) {
   return `${formatUnits(amount, decimals)} USDC.inj`;
 }
 
-async function deposit(ctx, io) {
-  const sender = ctx.addresses?.userInj || addressOf(ctx, "injLeave");
+export async function deposit(ctx, io) {
+  const hop = ctx.depositHop;
+  const sender = hop?.address || ctx.addresses?.userInj || addressOf(ctx, "injLeave");
   const receiver = ctx.addresses?.zafu || "";
   if (!sender) throw new Error("A required account is not connected.");
   if (!receiver) throw new Error("Zafu is not connected.");
   const pays = ctx.findings.penumbra || ctx.findings.noble || ctx.findings.osmosis;
-  let want = 0n;
-  if (pays) want += BigInt(ctx.arrivedInj || "0");
-  if (ctx.findings.usdcInj) want += BigInt(ctx.amountHeld || "0");
   const balance = await bank(io, "injective-1", sender, INJ_USDC_DENOM);
+  let want = 0n;
+  if (ctx.finishHeld) want = balance;
+  else {
+    if (pays) want += BigInt(ctx.arrivedInj || "0");
+    if (ctx.findings.usdcInj) want += BigInt(ctx.amountHeld || "0");
+  }
   const send = want > balance ? balance : want;
   if (send <= 0n) throw new Error("USDC.inj has not arrived.");
   await requireFee(io, "injective-1", sender, GAS.deposit, "INJ is below the transaction fee.");
   const before = await penumbraBalance(io);
-  const sent = await sign(io, {
-    chainId: "injective-1",
-    signer: sender,
-    gas: GAS.deposit,
-    messages: [transfer(sender, INJECTIVE_TO_PENUMBRA, INJ_USDC_DENOM, send, receiver, io.now())],
-  });
+  const messages = [transfer(sender, INJECTIVE_TO_PENUMBRA, INJ_USDC_DENOM, send, receiver, io.now())];
+  const sent = hop?.keyId
+    ? await io.signHop({
+      keyId: hop.keyId,
+      chainId: "injective-1",
+      signer: sender,
+      gas: GAS.deposit,
+      messages,
+    })
+    : await sign(io, {
+      chainId: "injective-1",
+      signer: sender,
+      gas: GAS.deposit,
+      messages,
+    });
   let latest = before;
   const target = before.inj + 1n;
   const after = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, target, async () => {
-    latest = await penumbraBalance(io);
+    try {
+      latest = await penumbraBalance(io);
+    } catch (error) {
+      if (!closedConnection(error)) throw error;
+      io.onProgress?.("Zafu closed the connection. The Injective transfer stays signed.");
+      return latest.inj;
+    }
     io.onPenumbra?.({ noble: latest.noble, inj: latest.inj, before: before.inj, decimals: latest.decimals });
     if (latest.inj < target) {
       io.onProgress?.(`Asking Zafu. Penumbra USDC.inj is ${penumbraText(latest.inj, latest.decimals)}.`);
@@ -507,6 +1001,10 @@ async function deposit(ctx, io) {
     throw new Error(`The packet has not arrived. Zafu still shows ${penumbraText(latest.inj, latest.decimals)}. ${sent.hash}`);
   }
   io.onPenumbra?.({ noble: latest.noble, inj: after, before: before.inj, decimals: latest.decimals });
+  if (hop?.keyId && io.wipeKey) {
+    await io.wipeKey(hop.keyId);
+    ctx.depositHop = null;
+  }
   return `Penumbra holds ${penumbraText(after, latest.decimals)}, up from ${penumbraText(before.inj, before.decimals)}. ${sent.hash}`;
 }
 
@@ -585,8 +1083,6 @@ async function broadcastWithdrawal(view, io, named, returnAddress, withdrawal, o
 async function leave(run, ctx, io) {
   const view = io.view;
   if (!view) throw new Error("Zafu is not connected.");
-  const osmosis = ctx.addresses?.userOsmosis || "";
-  if (!osmosis) throw new Error("A required account is not connected.");
   const receiver = ctx.addresses?.zafu || "";
   if (!receiver) throw new Error("Zafu is not connected.");
   const named = await usdcReturn(view);
@@ -601,32 +1097,39 @@ async function leave(run, ctx, io) {
   }
 
   let broadcast = false;
+  let buy = 0n;
+  let legs = null;
+  let usdcBefore = 0n;
+  const osmosis = ctx.addresses?.userOsmosis || "";
   try {
-    const injFee = fee("injective-1", GAS.deposit).amount;
-    const quoted = await quoteFee(io, injFee);
-    if (quoted.amountOut !== injFee) throw new Error("Osmosis did not quote the INJ swap.");
+    if (!osmosis.startsWith("osmo1")) throw new Error("The Osmosis account is not connected.");
+    const bought = await injLeg(io, osmosis);
+    const pricedAvax = await avaxLeg(io, osmosis);
+    legs = { ...bought, ...pricedAvax };
     if (!view.gasPrices) throw new Error("Penumbra did not price a USDC fee.");
     const priced = matchUsdcPrice(await view.gasPrices({}), named.assetId);
     if (!priced) throw new Error("Penumbra did not price a USDC fee.");
-    // Two signatures. Each pays its own fee, so the note keeps two ceilings.
-    const parts = splitSlice(run.amounts[run.sliceIndex], quoted.amountIn, feeAmount(priced) * 2n);
-    const noble = addressOf(ctx, "noble") || ORBITER;
-    const { route, msgs } = await circleQuote(io, parts.migrate, OSMOSIS_USDC_DENOM, "osmosis-1", [
-      osmosis,
-      noble,
-      hop.ethereum,
-      hop.address,
-    ]);
-    assertOsmosisCircleRoute(route);
-    if (route.amount_in !== parts.migrate) throw new Error("The transfer does not burn on arrival.");
-    const buyMemo = feeSwapMemo(hop.address, injFee);
-    const migrateMemo = migrationMemo(msgs, osmosis, parts.migrate);
-    io.onProgress?.("Asking Zafu to sign the fee withdrawal.");
-    await broadcastWithdrawal(view, io, named, ephemeral.address, {
-      amount: amountParts(parts.buy),
-      destinationChainAddress: FORWARD_RECEIVER,
-      ics20Memo: buyMemo,
-    }, () => { broadcast = true; });
+    const usdcFee = await sliceGasUsdc(io, osmosis, legGas(legs));
+    buy = legs.injInput + legs.avaxInput + usdcFee;
+    const slice = run.amounts[run.sliceIndex];
+    const penumbraFee = feeAmount(priced);
+    const parts = buy > 0n
+      ? splitSlice(slice, buy, penumbraFee * 2n)
+      : (() => {
+        const total = BigInt(slice);
+        if (total <= penumbraFee) throw new Error("This slice cannot buy the Injective fee.");
+        return { buy: "0", migrate: (total - penumbraFee).toString() };
+      })();
+    const migrateMemo = migrationMemo(hop.ethereum);
+    usdcBefore = await bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM);
+    if (buy > 0n) {
+      io.onProgress?.("Asking Zafu to sign the fee withdrawal.");
+      await broadcastWithdrawal(view, io, named, ephemeral.address, {
+        amount: amountParts(parts.buy),
+        destinationChainAddress: FORWARD_RECEIVER,
+        ics20Memo: osmosisUsdcMemo(osmosis),
+      }, () => { broadcast = true; });
+    }
     io.onProgress?.("Asking Zafu to sign the migration.");
     await broadcastWithdrawal(view, io, named, ephemeral.address, {
       amount: amountParts(parts.migrate),
@@ -642,45 +1145,41 @@ async function leave(run, ctx, io) {
     throw new Error(`${message} The fee withdrawal was already sent. The Injective account ${hop.address} is still held for this page session.`);
   }
 
+  ctx.depositHop = hop;
+  ctx.hopBroadcast = true;
+  io.onHop?.({ address: hop.address, ethereum: hop.ethereum, inj: 0n, usdc: 0n, avax: null });
   try {
     const injFee = BigInt(fee("injective-1", GAS.deposit).amount);
-    const deadline = io.now() + (io.cctpTimeoutMs ?? CCTP_TIMEOUT_MS);
-    let injHeld = 0n;
-    let usdcHeld = 0n;
-    while (io.now() <= deadline) {
+    let injHeld = await bank(io, "injective-1", hop.address, "inj");
+    let usdcHeld = await bank(io, "injective-1", hop.address, INJ_USDC_DENOM);
+    if (injHeld < injFee || usdcHeld < 1n) {
+      if (buy > 0n) {
+        io.onProgress?.(`Waiting for ${formatUnits(buy, 6)} USDC on Osmosis.`);
+        const landed = await untilAtLeast(
+          io,
+          io.ibcTimeoutMs ?? IBC_TIMEOUT_MS,
+          usdcBefore + buy,
+          () => bank(io, "osmosis-1", osmosis, OSMOSIS_USDC_DENOM),
+        );
+        if (landed == null) throw new Error("Osmosis did not receive the fee slice.");
+      }
+      io.onProgress?.("Buying INJ and AVAX for the ephemeral account.");
+      await bridgeGas(ctx, io, hop, legs, false);
+      ctx.burnLookup = "recipient";
+      ctx.usdcInjBefore = (await bank(io, "injective-1", hop.address, INJ_USDC_DENOM)).toString();
+      await issueInj(ctx, io);
       injHeld = await bank(io, "injective-1", hop.address, "inj");
       usdcHeld = await bank(io, "injective-1", hop.address, INJ_USDC_DENOM);
-      if (injHeld >= injFee && usdcHeld >= 1n) break;
-      io.onProgress?.(`Waiting for the Injective account. INJ is ${formatUnits(injHeld, 18)}. USDC.inj is ${formatUnits(usdcHeld, 6)}.`);
-      await io.sleep(io.intervalMs ?? POLL_MS);
     }
     if (injHeld < injFee || usdcHeld < 1n) {
       throw new Error(`The Injective account did not receive the fee and the USDC. INJ is ${formatUnits(injHeld, 18)}. USDC.inj is ${formatUnits(usdcHeld, 6)}.`);
     }
-    const before = await penumbraBalance(io);
-    const sent = await io.signHop({
-      keyId: hop.keyId,
-      chainId: "injective-1",
-      signer: hop.address,
-      gas: GAS.deposit,
-      messages: [transfer(hop.address, INJECTIVE_TO_PENUMBRA, INJ_USDC_DENOM, usdcHeld, receiver, io.now())],
-    });
-    let latest = before;
-    const target = before.inj + 1n;
-    const after = await untilAtLeast(io, io.ibcTimeoutMs ?? IBC_TIMEOUT_MS, target, async () => {
-      latest = await penumbraBalance(io);
-      io.onPenumbra?.({ noble: latest.noble, inj: latest.inj, before: before.inj, decimals: latest.decimals });
-      if (latest.inj < target) {
-        io.onProgress?.(`Asking Zafu. Penumbra USDC.inj is ${penumbraText(latest.inj, latest.decimals)}.`);
-      }
-      return latest.inj;
-    });
-    if (after == null) {
-      throw new Error(`The packet has not arrived. Zafu still shows ${penumbraText(latest.inj, latest.decimals)}. ${sent.hash}`);
-    }
-    await io.wipeKey(hop.keyId);
-    return `Penumbra holds ${penumbraText(after, latest.decimals)}, up from ${penumbraText(before.inj, before.decimals)}. ${sent.hash}`;
+    ctx.arrivedInj = usdcHeld.toString();
+    const detail = await deposit(ctx, io);
+    return detail;
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("still held")) throw error;
     throw heldKey(error, hop.address);
   }
 }
@@ -707,7 +1206,10 @@ export async function returnOsmosisToPenumbra(ctx, io) {
   if (!noble.startsWith("noble1")) throw new Error("A Noble account is not connected.");
   const amount = BigInt(ctx.amountOsmosis || "0");
   if (amount <= 0n) throw new Error("Choose an Osmosis amount.");
-  await requireFee(io, "osmosis-1", sender, GAS.hook, "Osmosis gas is short.");
+  const priced = await osmosisFeeCoin(io, sender, GAS.hook);
+  const held = await bank(io, "osmosis-1", sender, OSMOSIS_USDC_DENOM);
+  const sendAmount = sendable(amount, held, priced, OSMOSIS_USDC_DENOM);
+  if (sendAmount <= 0n) throw new Error("Osmosis gas is short.");
   io.onProgress?.("Asking the light client.");
   const forward = await nobleForwardChannel(view, io.channels, io.clients);
   const before = await penumbraBalance(io);
@@ -719,7 +1221,8 @@ export async function returnOsmosisToPenumbra(ctx, io) {
       chainId: "osmosis-1",
       signer: sender,
       gas: GAS.hook,
-      messages: [transfer(sender, OSMOSIS_TO_NOBLE, OSMOSIS_USDC_DENOM, amount, noble, io.now(), memo)],
+      feeAmount: priced,
+      messages: [transfer(sender, OSMOSIS_TO_NOBLE, OSMOSIS_USDC_DENOM, sendAmount, noble, io.now(), memo)],
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -837,7 +1340,7 @@ export async function walkMigration({ input, ctx, io, onUpdate }) {
     }
     return run;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    let message = error instanceof Error ? error.message : String(error);
     if (run.status === "running") {
       const key = run.phase === "exit" ? `leave:${run.sliceIndex}` : currentStep(run).id;
       details[key] = message;
@@ -847,7 +1350,22 @@ export async function walkMigration({ input, ctx, io, onUpdate }) {
     } catch {
       // The step error is the one the page shows.
     }
-    if (run.status === "running") run = reduce(run, { type: "FAIL", reason: message });
+    if (ctx.depositHop?.keyId && io.wipeKey) {
+      if (ctx.hopBroadcast) {
+        message = `${message} The Injective account ${ctx.depositHop.address} is still held for this page session.`;
+      } else {
+        try {
+          await io.wipeKey(ctx.depositHop.keyId);
+        } catch {
+          // The step error is the one the page shows.
+        }
+      }
+    }
+    if (run.status === "running") {
+      const key = run.phase === "exit" ? `leave:${run.sliceIndex}` : currentStep(run).id;
+      details[key] = message;
+      run = reduce(run, { type: "FAIL", reason: message });
+    }
     publish();
     return run;
   }

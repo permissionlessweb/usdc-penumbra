@@ -4,6 +4,7 @@ import { initRun, keysNeeded, reduce, splitAmount, stepState } from "./machine.j
 import {
   INJ_ON_OSMOSIS,
   INJ_USDC_DENOM,
+  ORBITER,
   OSMOSIS_USDC_DENOM,
   RELEASE_DENOM,
   USER_INJ,
@@ -80,6 +81,7 @@ describe("steps", () => {
     assert.equal(enterRun.jitterMaxSec, 0);
     assert.equal(enterRun.amountIn, "50000000");
     assert.deepEqual(enterRun.steps.map((step) => step.id), [
+      "gas-osmosis",
       "cctp-noble",
       "cctp-forward",
       "deposit",
@@ -244,33 +246,33 @@ describe("messages", () => {
     const leave = describeStep("leave", ctx);
     assert.equal(leave.messages.length, 2);
     assert.equal(leave.messages[0].type, "penumbra-withdraw");
-    assert.equal(leave.messages[0].value.to, "INJ");
-    assert.equal(leave.messages[0].value.receiver, "a new Injective account");
-    assert.equal(leave.messages[1].value.to, "USDC.inj");
+    assert.equal(leave.messages[0].value.to, "Osmosis");
+    assert.equal(leave.messages[0].value.receiver, "the connected Osmosis account");
+    assert.equal(leave.messages[1].value.to, "Avalanche");
     assert.equal(leave.messages[1].value.amount, "the remainder");
     assert.deepEqual(signingGaps(leave.messages), []);
 
     const burn = describeStep("cctp-noble", ctx);
-    assert.equal(burn.messages[0].type, "cctpTransfer");
+    assert.equal(burn.messages[0].type, "/circle.cctp.v1.MsgDepositForBurn");
     assert.equal(burn.messages[0].value.burn_token, "uusdc");
     assert.equal(burn.messages[0].value.asset, "USDC.noble");
     assert.equal(burn.messages[0].value.fromChainId, "noble-1");
-    assert.equal(burn.messages[0].value.toChainId, "43114");
+    assert.equal(burn.messages[0].value.destination_domain, 1);
     assert.equal(burn.messages[0].value.amount, "50000000");
     assert.equal(burn.messages[0].value.signer, "noble1q");
     assert.equal(burn.messages[0].value.mint_recipient, "0xabc");
+    assert.equal(burn.messages[0].value.destination_caller, "empty");
 
     const forward = describeStep("cctp-forward", ctx);
-    assert.equal(forward.messages[0].type, "cctpTransfer");
-    assert.equal(forward.messages[1].type, "cctpTransferV2");
-    assert.equal(forward.messages[1].value.toChainId, "1776");
-    assert.equal(forward.messages[1].value.same_transaction_as_avalanche_receive, true);
-    assert.equal(forward.messages[2].type, "transferAssetRelease");
-    assert.equal(forward.messages[2].value.denom, RELEASE_DENOM);
-    assert.equal(forward.messages[2].value.asset, "USDC.inj");
-    assert.equal(forward.messages[2].value.amount, "50000000");
-    assert.equal(forward.messages[2].value.released, true);
-    assert.equal(forward.messages[2].value.recipient, "0xdef");
+    assert.equal(forward.messages[0].type, "iris");
+    assert.equal(forward.messages[1].type, "receiveMessage");
+    assert.equal(forward.messages[1].value.domain, 1);
+    assert.equal(forward.messages[2].type, "depositForBurn");
+    assert.equal(forward.messages[2].value.destinationDomain, 29);
+    assert.equal(forward.messages[2].value.destinationCaller, "32 zero bytes");
+    assert.equal(forward.messages[2].value.mint_recipient, "0xdef");
+    assert.equal(forward.messages[3].type, "receiveMessage");
+    assert.equal(forward.messages[3].value.domain, 29);
 
     const deposit = describeStep("deposit", ctx);
     assert.equal(deposit.messages[0].value.sender, "inj1l");
@@ -306,7 +308,8 @@ describe("messages", () => {
     assert.equal(gather.messages[0].value.token.amount, "40000000");
     assert.equal(gather.messages[0].value.token.denom, OSMOSIS_USDC_DENOM);
     assert.equal(gather.messages[0].value.source_channel, "channel-750");
-    assert.equal(gather.messages[0].value.receiver, "noble1out");
+    assert.equal(gather.messages[0].value.receiver, ORBITER);
+    assert.equal(gather.messages[0].value.memo, "built at signing");
     assert.equal(gather.messages[0].value.sender.includes("not connected"), true);
 
     const gas = describeStep("gas-osmosis", ctx);

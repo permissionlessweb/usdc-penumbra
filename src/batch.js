@@ -1,7 +1,7 @@
 // One Penumbra slice. Two withdrawals, each its own signature, then a deposit
 // from the slice's Injective account. See docs/batch-out.md.
 
-import { osmosisTransfer } from "./circle.js";
+import { orbiterMemo } from "./circle.js";
 import { INJ_ON_OSMOSIS, NOBLE_TO_OSMOSIS } from "./route.js";
 
 // CrossChainSwaps v1.2, code id 37, read from lcd.osmosis.zone on 2026-11-01.
@@ -101,6 +101,20 @@ export function penumbraForwardMemo(receiver, channel) {
   });
 }
 
+// USDC lands on the Osmosis account. The page swaps or bridges from there.
+export function osmosisUsdcMemo(receiver) {
+  if (!String(receiver).startsWith("osmo1")) throw new Error("The Osmosis account is not connected.");
+  return JSON.stringify({
+    forward: {
+      receiver,
+      port: "transfer",
+      channel: NOBLE_TO_OSMOSIS,
+      timeout: "10m",
+      retries: 2,
+    },
+  });
+}
+
 export function feeSwapMemo(receiver, minOut) {
   if (!String(receiver).startsWith("inj1")) throw new Error("The fee swap has no Injective receiver.");
   if (BigInt(minOut) <= 0n) throw new Error("Osmosis did not quote the INJ swap.");
@@ -128,7 +142,7 @@ export function feeSwapMemo(receiver, minOut) {
   });
 }
 
-// Skip's Osmosis transfer is checked and not signed. The memo string is copied.
-export function migrationMemo(msgs, sender, amount) {
-  return osmosisTransfer(msgs, sender, amount).value.memo;
+// The migration withdrawal carries the same memo as the Osmosis return.
+export function migrationMemo(mintRecipient) {
+  return orbiterMemo(mintRecipient);
 }

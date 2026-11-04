@@ -1,6 +1,6 @@
 <svg id="flow-plate" xmlns="http://www.w3.org/2000/svg" width="720" height="400" viewBox="0 0 720 400" role="img" aria-labelledby="flow-title flow-desc" fill="none" font-family="Iowan Old Style, Palatino, 'Palatino Linotype', Georgia, serif">
   <title id="flow-title">USDC.noble moves to a diversified address of the Zafu account</title>
-  <desc id="flow-desc">Keplr and Zafu connect together. Keplr identifies USDC.noble, including a balance on Osmosis. That balance returns to Noble. Circle burns it and issues USDC.inj. When the Injective wallet cannot pay the fee, Osmosis buys that INJ and bridges it to the wallet. The transfer arrives at a diversified address held by the connected Zafu account.</desc>
+  <desc id="flow-desc">Keplr and Zafu connect together. Keplr identifies USDC.noble, including a balance on Osmosis. That balance returns to Noble. Circle burns it. The user relays the mint, then burns toward the Injective account and relays that mint. When the Injective wallet cannot pay the fee, Osmosis buys that INJ and bridges it to the wallet. The transfer arrives at a diversified address held by the connected Zafu account.</desc>
   <defs>
     <clipPath id="clip-noble"><circle cx="168" cy="168" r="33"/></clipPath>
     <clipPath id="clip-inj"><circle cx="360" cy="168" r="33"/></clipPath>
